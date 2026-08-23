@@ -22,7 +22,7 @@ from dms_ai_usage.collector import (
 
 
 class ClaudeParserTests(unittest.TestCase):
-    def test_fable_is_separate(self) -> None:
+    def test_fable_is_separate_and_first(self) -> None:
         windows = parse_claude_usage(
             {
                 "five_hour": {"utilization": 20, "resets_at": "2026-08-24T01:00:00Z"},
@@ -37,8 +37,8 @@ class ClaudeParserTests(unittest.TestCase):
                 ],
             }
         )
-        self.assertEqual([item["label"] for item in windows], ["5h", "7d", "Fable"])
-        self.assertEqual(windows[2]["remaining_percent"], 45)
+        self.assertEqual([item["label"] for item in windows], ["Fable", "5h", "7d"])
+        self.assertEqual(windows[0]["remaining_percent"], 45)
 
 
 class CodexParserTests(unittest.TestCase):
@@ -53,6 +53,96 @@ class CodexParserTests(unittest.TestCase):
         )
         self.assertEqual([item["label"] for item in windows], ["5h", "7d"])
         self.assertEqual(windows[0]["remaining_percent"], 75)
+
+    def test_windows_are_ordered_five_hour_first(self) -> None:
+        windows = parse_codex_rate_limits(
+            {
+                "rateLimits": {
+                    "primary": {"usedPercent": 10, "windowDurationMins": 10080, "resetsAt": 1},
+                    "secondary": {"usedPercent": 20, "windowDurationMins": 300, "resetsAt": 2},
+                }
+            }
+        )
+        self.assertEqual([item["label"] for item in windows], ["5h", "7d"])
+
+    def test_spark_buckets_are_dropped(self) -> None:
+        windows = parse_codex_rate_limits(
+            {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": {"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 1},
+                        "secondary": {"usedPercent": 60, "windowDurationMins": 10080, "resetsAt": 2},
+                    },
+                    "codex_spark": {
+                        "limitName": "GPT-5.3-Codex-Spark",
+                        "primary": {"usedPercent": 0, "windowDurationMins": 300, "resetsAt": 3},
+                        "secondary": {"usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 4},
+                    },
+                }
+            }
+        )
+        self.assertEqual([item["label"] for item in windows], ["5h", "7d"])
+        for window in windows:
+            self.assertNotIn("spark", f"{window['id']} {window['label']}".lower())
+
+    def test_spark_bucket_named_only_in_limit_name_is_dropped(self) -> None:
+        windows = parse_codex_rate_limits(
+            {
+                "rateLimitsByLimitId": {
+                    "secondary_pool": {
+                        "limitName": "Codex-Spark",
+                        "primary": {"usedPercent": 5, "windowDurationMins": 300, "resetsAt": 1},
+                    }
+                }
+            }
+        )
+        self.assertEqual(windows, [])
+
+
+class StaleCacheTests(unittest.TestCase):
+    def test_stale_codex_windows_drop_spark(self) -> None:
+        fresh = account_result("codex", "Codex 1", "error", error="network_error")
+        previous = account_result(
+            "codex",
+            "Codex 1",
+            "ok",
+            windows=[
+                {"id": "codex_spark:primary", "label": "GPT-5.3-Codex-Spark 5h", "remaining_percent": 100},
+                {"id": "codex:secondary", "label": "7d", "remaining_percent": 40},
+                {"id": "codex:primary", "label": "5h", "remaining_percent": 80},
+            ],
+            updated_at="2026-08-22T00:00:00Z",
+        )
+        result = stale_or_error(fresh, previous)
+        self.assertEqual(result["status"], "stale")
+        self.assertEqual([item["label"] for item in result["windows"]], ["5h", "7d"])
+
+    def test_stale_with_only_spark_windows_becomes_error(self) -> None:
+        fresh = account_result("codex", "Codex 1", "error", error="network_error")
+        previous = account_result(
+            "codex",
+            "Codex 1",
+            "ok",
+            windows=[{"id": "codex_spark:primary", "label": "GPT-5.3-Codex-Spark 5h", "remaining_percent": 100}],
+        )
+        result = stale_or_error(fresh, previous)
+        self.assertIs(result, fresh)
+
+    def test_stale_claude_windows_are_reordered(self) -> None:
+        fresh = account_result("claude", "Claude 1", "error", error="network_error")
+        previous = account_result(
+            "claude",
+            "Claude 1",
+            "ok",
+            windows=[
+                {"id": "five_hour", "label": "5h", "remaining_percent": 80},
+                {"id": "seven_day", "label": "7d", "remaining_percent": 60},
+                {"id": "model:fable", "label": "Fable", "remaining_percent": 45},
+            ],
+        )
+        result = stale_or_error(fresh, previous)
+        self.assertEqual(result["status"], "stale")
+        self.assertEqual([item["label"] for item in result["windows"]], ["Fable", "5h", "7d"])
 
 
 class OutputPrivacyTests(unittest.TestCase):
@@ -115,6 +205,20 @@ class OutputPrivacyTests(unittest.TestCase):
             ),
         ]
         self.assertEqual(bar_text(accounts), "C1 80/F45 · X1 75")
+
+    def test_compact_bar_unaffected_by_window_order(self) -> None:
+        accounts = [
+            account_result(
+                "claude",
+                "Claude 1",
+                "ok",
+                windows=[
+                    {"id": "model:fable", "label": "Fable", "remaining_percent": 45},
+                    {"id": "five_hour", "label": "5h", "remaining_percent": 80},
+                ],
+            )
+        ]
+        self.assertEqual(bar_text(accounts), "C1 80/F45")
 
 
 if __name__ == "__main__":

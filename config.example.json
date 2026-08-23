@@ -3,22 +3,22 @@
   "timeout_seconds": 8,
   "claude": [
     {
-      "label": "Claude 1",
-      "config_dir": "~/.claude"
+      "label": "Personal",
+      "config_dir": "~/ai-subscriptions/claude-personal"
     },
     {
-      "label": "Claude 2",
-      "config_dir": "~/.claude-2"
+      "label": "Work",
+      "config_dir": "~/ai-subscriptions/claude-work"
     }
   ],
   "codex": [
     {
-      "label": "Codex 1",
-      "home": "~/.codex"
+      "label": "Personal",
+      "home": "~/ai-subscriptions/codex-personal"
     },
     {
-      "label": "Codex 2",
-      "home": "~/.codex-2"
+      "label": "Work",
+      "home": "~/ai-subscriptions/codex-work"
     }
   ]
 }

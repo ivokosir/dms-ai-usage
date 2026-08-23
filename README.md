@@ -30,7 +30,7 @@ Reload without restarting the shell:
 ```bash
 dms ipc call plugin-scan scan
 dms ipc call plugins enable dmsAiUsage
-dms ipc call plugins reload dmsAiUsage
+dms ipc call plugin-scan reload dmsAiUsage
 ```
 
 ## Configure accounts
@@ -42,12 +42,12 @@ Only labels and profile directories go in the configuration file:
   "refresh_seconds": 120,
   "timeout_seconds": 8,
   "claude": [
-    {"label": "Claude 1", "config_dir": "~/.claude"},
-    {"label": "Claude 2", "config_dir": "~/.claude-2"}
+    {"label": "Personal", "config_dir": "~/ai-subscriptions/claude-personal"},
+    {"label": "Work", "config_dir": "~/ai-subscriptions/claude-work"}
   ],
   "codex": [
-    {"label": "Codex 1", "home": "~/.codex"},
-    {"label": "Codex 2", "home": "~/.codex-2"}
+    {"label": "Personal", "home": "~/ai-subscriptions/codex-personal"},
+    {"label": "Work", "home": "~/ai-subscriptions/codex-work"}
   ]
 }
 ```
@@ -55,8 +55,9 @@ Only labels and profile directories go in the configuration file:
 Each extra profile needs a one-time login:
 
 ```bash
-CLAUDE_CONFIG_DIR="$HOME/.claude-2" claude auth login
-CODEX_HOME="$HOME/.codex-2" codex login
+mkdir -p "$HOME/ai-subscriptions/claude-work" "$HOME/ai-subscriptions/codex-work"
+CLAUDE_CONFIG_DIR="$HOME/ai-subscriptions/claude-work" claude auth login
+CODEX_HOME="$HOME/ai-subscriptions/codex-work" codex login
 ```
 
 This widget only displays usage. It never switches accounts or sends prompts.
@@ -82,7 +83,15 @@ Credentials, emails, absolute profile paths, and raw provider responses are neve
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v
 ```
+
+Capture the real widget after an edit:
+
+```bash
+./scripts/capture-ui.sh /tmp/dms-ai-usage-preview
+```
+
+This reloads DMS and saves cropped `bar.ui.png` and `popout.ui.png` images without touching the clipboard or storing a full desktop screenshot. It currently requires niri, jq, and ImageMagick.
 
 MIT licensed.

@@ -82,6 +82,39 @@ def make_window(window_id: str, label: str, used: Any, resets_at: Any = None) ->
     return result
 
 
+def is_spark_window(window: Any) -> bool:
+    if not isinstance(window, dict):
+        return True
+    text = f"{window.get('id', '')} {window.get('label', '')}".lower()
+    return "spark" in text
+
+
+def strip_spark_windows(windows: Any) -> list[dict[str, Any]]:
+    if not isinstance(windows, list):
+        return []
+    return [window for window in windows if not is_spark_window(window)]
+
+
+def window_sort_key(provider: str, window: dict[str, Any]) -> int:
+    label = str(window.get("label", "")).lower()
+    if provider == "claude":
+        # Weekly-scoped model windows (Fable) first, then 5h, then 7d.
+        if label == "5h":
+            return 1
+        if label == "7d":
+            return 2
+        return 0
+    if label == "5h" or label.endswith(" 5h"):
+        return 0
+    if label == "7d" or label.endswith(" 7d"):
+        return 1
+    return 2
+
+
+def order_windows(provider: str, windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(windows, key=lambda window: window_sort_key(provider, window))
+
+
 def parse_claude_usage(data: dict[str, Any]) -> list[dict[str, Any]]:
     windows: list[dict[str, Any]] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
@@ -110,7 +143,7 @@ def parse_claude_usage(data: dict[str, Any]) -> list[dict[str, Any]]:
                     limit.get("resets_at"),
                 )
             )
-    return windows
+    return order_windows("claude", windows)
 
 
 def fetch_claude(
@@ -196,6 +229,10 @@ def parse_codex_rate_limits(result: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(limit_id, str) or not isinstance(bucket, dict):
             continue
         bucket_name = bucket.get("limitName")
+        # Spark buckets must never reach output or cache.
+        spark_text = f"{limit_id} {bucket_name if isinstance(bucket_name, str) else ''}".lower()
+        if "spark" in spark_text:
+            continue
         for slot, fallback in (("primary", "Primary"), ("secondary", "Secondary")):
             raw = bucket.get(slot)
             if not isinstance(raw, dict) or raw.get("usedPercent") is None:
@@ -215,7 +252,7 @@ def parse_codex_rate_limits(result: dict[str, Any]) -> list[dict[str, Any]]:
                     raw.get("resetsAt"),
                 )
             )
-    return windows
+    return order_windows("codex", strip_spark_windows(windows))
 
 
 class CodexRpcClient:
@@ -408,11 +445,18 @@ def stale_or_error(fresh: dict[str, Any], previous: dict[str, Any] | None) -> di
     if fresh.get("status") != "error":
         return fresh
     if previous and previous.get("windows") and previous.get("provider") == fresh.get("provider"):
+        provider = str(fresh["provider"])
+        windows = previous.get("windows")
+        windows = strip_spark_windows(windows) if provider == "codex" else (
+            [window for window in windows if isinstance(window, dict)] if isinstance(windows, list) else []
+        )
+        if not windows:
+            return fresh
         return account_result(
-            str(fresh["provider"]),
+            provider,
             str(fresh["label"]),
             "stale",
-            windows=previous.get("windows") if isinstance(previous.get("windows"), list) else [],
+            windows=order_windows(provider, windows),
             updated_at=previous.get("updated_at") if isinstance(previous.get("updated_at"), str) else None,
             error=str(fresh.get("error", "unavailable")),
         )

@@ -7,3 +7,5 @@ dist/
 *.egg-info/
 config.json
 usage.json
+.ui-captures/
+*.ui.png
