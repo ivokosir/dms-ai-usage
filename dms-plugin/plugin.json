@@ -1,0 +1,17 @@
+{
+  "id": "dmsAiUsage",
+  "name": "AI Usage",
+  "description": "Claude and Codex subscription headroom",
+  "version": "0.1.0",
+  "author": "dms-ai-usage contributors",
+  "type": "widget",
+  "capabilities": [
+    "dankbar-widget"
+  ],
+  "component": "./AiUsageWidget.qml",
+  "icon": "data_usage",
+  "requires_dms": ">=1.5.0",
+  "permissions": [
+    "process"
+  ]
+}

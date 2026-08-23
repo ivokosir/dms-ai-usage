@@ -1,0 +1,24 @@
+{
+  "refresh_seconds": 120,
+  "timeout_seconds": 8,
+  "claude": [
+    {
+      "label": "Claude 1",
+      "config_dir": "~/.claude"
+    },
+    {
+      "label": "Claude 2",
+      "config_dir": "~/.claude-2"
+    }
+  ],
+  "codex": [
+    {
+      "label": "Codex 1",
+      "home": "~/.codex"
+    },
+    {
+      "label": "Codex 2",
+      "home": "~/.codex-2"
+    }
+  ]
+}
