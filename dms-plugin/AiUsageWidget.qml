@@ -12,7 +12,7 @@ PluginComponent {
 
     property var accounts: []
     property string generatedAt: ""
-    property int refreshSeconds: 120
+    property int refreshSeconds: 600
     property bool loadFailed: false
     property string collectorPath: Quickshell.env("HOME") + "/.local/bin/dms-ai-usage"
 
@@ -191,6 +191,13 @@ PluginComponent {
         if (hours < 24)
             return "in " + hours + "h " + (minutes % 60) + "m"
         return "in " + Math.floor(hours / 24) + "d " + (hours % 24) + "h"
+    }
+
+    function captionWithReset(caption, item, fallbackItem) {
+        let reset = root.resetIn(item)
+        if (!reset)
+            reset = root.resetIn(fallbackItem)
+        return reset ? caption + " · " + reset : caption
     }
 
     component CapacityRing: Item {
@@ -630,13 +637,17 @@ PluginComponent {
                                     CompactStat {
                                         width: (parent.width - parent.spacing) / 2
                                         windowData: root.modelWindow(claudeCard.modelData)
-                                        caption: windowData && windowData.label ? String(windowData.label) : "Fable"
+                                        caption: root.captionWithReset(
+                                            windowData && windowData.label ? String(windowData.label) : "Fable",
+                                            windowData,
+                                            root.labeledWindow(claudeCard.modelData, "7d")
+                                        )
                                     }
 
                                     CompactStat {
                                         width: (parent.width - parent.spacing) / 2
                                         windowData: root.labeledWindow(claudeCard.modelData, "5h")
-                                        caption: "5h"
+                                        caption: root.captionWithReset("5h", windowData, null)
                                     }
                                 }
                             }

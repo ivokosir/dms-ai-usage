@@ -39,7 +39,7 @@ Only labels and profile directories go in the configuration file:
 
 ```json
 {
-  "refresh_seconds": 120,
+  "refresh_seconds": 600,
   "timeout_seconds": 8,
   "claude": [
     {"label": "Personal", "config_dir": "~/ai-subscriptions/claude-personal"},
@@ -70,15 +70,17 @@ dms-ai-usage --pretty
 
 ## Authentication behavior
 
-Claude usage is fetched from Anthropic's OAuth usage endpoint using the access token already owned by Claude Code. This tool never reads the refresh token, refreshes credentials, or writes to a Claude profile. If the access token is expired, the last good result is marked stale until Claude Code refreshes it during normal work.
+Claude usage is fetched from Anthropic's OAuth usage endpoint using the credentials already owned by Claude Code. Access tokens expire after several hours, so the widget refreshes one shortly before expiry and retries once after an authentication failure. Anthropic rotates refresh tokens; both new tokens are therefore saved together to the same profile with an atomic mode-`0600` write. A per-profile lock prevents two widget processes from refreshing the same token at once, and a concurrent update from Claude Code is never overwritten.
+
+The default 10-minute polling interval keeps the bar current without hammering the experimental endpoint. Provider rate limits or network failures retain the last sanitized result as stale data.
 
 Codex usage is fetched through the official local [`codex app-server`](https://developers.openai.com/codex/app-server) method `account/rateLimits/read`. Codex owns its credential lifecycle.
 
-Anthropic's OAuth usage endpoint is not a documented public API and may change. Failures retain the last sanitized result and make staleness visible.
+Anthropic's OAuth usage endpoint is not a documented public API and may change.
 
 ## Privacy
 
-Credentials, emails, absolute profile paths, and raw provider responses are never written to the cache or printed. The cache is created with mode `0600` under `~/.cache/dms-ai-usage/usage.json`.
+Credentials, emails, absolute profile paths, and raw provider responses are never written to the cache or printed. Refresh tokens are sent only to Anthropic's token endpoint and never leave their source profile on disk. The cache is created with mode `0600` under `~/.cache/dms-ai-usage/usage.json`.
 
 ## Development
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import http.client
 import json
 import math
@@ -16,7 +17,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_OAUTH_SCOPE = (
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+)
+CLAUDE_REFRESH_SKEW_MS = 5 * 60 * 1000
+USER_AGENT = "dms-ai-usage/0.2.0"
 MAX_INPUT_BYTES = 1_048_576
 
 
@@ -146,40 +154,196 @@ def parse_claude_usage(data: dict[str, Any]) -> list[dict[str, Any]]:
     return order_windows("claude", windows)
 
 
-def fetch_claude(
-    account: dict[str, Any],
-    timeout: float,
-    *,
-    opener: Callable[..., Any] = open_without_redirects,
-) -> dict[str, Any]:
-    label = safe_label(account.get("label"), "Claude")
-    config_value = account.get("config_dir")
-    if not isinstance(config_value, str) or not config_value:
-        raise UsageError("invalid_config")
+def write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
 
-    credentials = read_json(expand_path(config_value) / ".credentials.json")
+
+def claude_oauth(credentials: dict[str, Any]) -> dict[str, Any]:
     oauth = credentials.get("claudeAiOauth")
     if not isinstance(oauth, dict):
         raise UsageError("not_connected")
-    access_token = oauth.get("accessToken")
-    if not isinstance(access_token, str) or not access_token:
-        raise UsageError("not_connected")
-    expires_at = oauth.get("expiresAt")
-    if isinstance(expires_at, (int, float)) and expires_at <= time.time() * 1000:
-        raise UsageError("auth_expired")
+    return oauth
 
+
+def token_is_fresh(oauth: dict[str, Any], now_ms: float, *, skew_ms: int = 0) -> bool:
+    access_token = oauth.get("accessToken")
+    expires_at = oauth.get("expiresAt")
+    return (
+        isinstance(access_token, str)
+        and bool(access_token)
+        and isinstance(expires_at, (int, float))
+        and not isinstance(expires_at, bool)
+        and expires_at > now_ms + skew_ms
+    )
+
+
+def refresh_claude_credentials(
+    credentials_path: Path,
+    timeout: float,
+    *,
+    opener: Callable[..., Any] = open_without_redirects,
+    force: bool = False,
+    rejected_access_token: str | None = None,
+) -> dict[str, Any]:
+    """Refresh one profile and persist Anthropic's rotated token pair safely."""
+    lock_path = credentials_path.with_name(f".{credentials_path.name}.dms-ai-usage.lock")
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+        credentials = read_json(credentials_path)
+        oauth = claude_oauth(credentials)
+        now_ms = time.time() * 1000
+        if (
+            force
+            and rejected_access_token
+            and oauth.get("accessToken") != rejected_access_token
+            and token_is_fresh(oauth, now_ms)
+        ):
+            return credentials
+        if not force and token_is_fresh(oauth, now_ms, skew_ms=CLAUDE_REFRESH_SKEW_MS):
+            return credentials
+
+        refresh_token = oauth.get("refreshToken")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise UsageError("auth_expired")
+
+        scopes = oauth.get("scopes")
+        if isinstance(scopes, list) and all(isinstance(item, str) for item in scopes):
+            scope = " ".join(item for item in scopes if item) or CLAUDE_OAUTH_SCOPE
+        elif isinstance(scopes, str) and scopes:
+            scope = scopes
+        else:
+            scope = CLAUDE_OAUTH_SCOPE
+
+        body = json.dumps(
+            {
+                "client_id": CLAUDE_OAUTH_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "scope": scope,
+            },
+            separators=(",", ":"),
+        ).encode()
+        request = urllib.request.Request(
+            CLAUDE_TOKEN_URL,
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+            method="POST",
+        )
+        try:
+            with opener(request, timeout=timeout) as response:
+                raw = response.read(MAX_INPUT_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if exc.code in (400, 401, 403):
+                # Claude Code may have refreshed this same profile concurrently.
+                newest = read_json(credentials_path)
+                newest_oauth = claude_oauth(newest)
+                if newest_oauth.get("refreshToken") != refresh_token and token_is_fresh(
+                    newest_oauth, time.time() * 1000
+                ):
+                    return newest
+                raise UsageError("auth_expired") from exc
+            if exc.code == 429:
+                raise UsageError("rate_limited") from exc
+            raise UsageError("provider_error") from exc
+        except (TimeoutError, urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            raise UsageError("network_error") from exc
+
+        if len(raw) > MAX_INPUT_BYTES:
+            raise UsageError("bad_response")
+        try:
+            token_data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise UsageError("bad_response") from exc
+        if not isinstance(token_data, dict):
+            raise UsageError("bad_response")
+
+        access_token = token_data.get("access_token")
+        expires_in = token_data.get("expires_in")
+        if (
+            not isinstance(access_token, str)
+            or not access_token
+            or not isinstance(expires_in, (int, float))
+            or isinstance(expires_in, bool)
+            or expires_in <= 0
+        ):
+            raise UsageError("bad_response")
+
+        # Never overwrite a rotation completed while the network call was in flight.
+        newest = read_json(credentials_path)
+        newest_oauth = claude_oauth(newest)
+        if newest_oauth.get("refreshToken") != refresh_token:
+            if token_is_fresh(newest_oauth, time.time() * 1000):
+                return newest
+            raise UsageError("auth_expired")
+
+        updated_oauth = dict(newest_oauth)
+        updated_oauth["accessToken"] = access_token
+        rotated_refresh = token_data.get("refresh_token")
+        if isinstance(rotated_refresh, str) and rotated_refresh:
+            updated_oauth["refreshToken"] = rotated_refresh
+        updated_oauth["expiresAt"] = int(time.time() * 1000 + float(expires_in) * 1000)
+        refresh_expires_in = token_data.get("refresh_token_expires_in")
+        if (
+            isinstance(refresh_expires_in, (int, float))
+            and not isinstance(refresh_expires_in, bool)
+            and refresh_expires_in > 0
+        ):
+            updated_oauth["refreshTokenExpiresAt"] = int(
+                time.time() * 1000 + float(refresh_expires_in) * 1000
+            )
+
+        newest["claudeAiOauth"] = updated_oauth
+        write_private_json(credentials_path, newest)
+        return newest
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def fetch_claude_usage_json(
+    access_token: str,
+    timeout: float,
+    *,
+    opener: Callable[..., Any],
+) -> dict[str, Any]:
     request = urllib.request.Request(
         CLAUDE_USAGE_URL,
         headers={
             "Authorization": f"Bearer {access_token}",
             "anthropic-beta": CLAUDE_OAUTH_BETA,
-            "User-Agent": "dms-ai-usage/0.1.0",
+            "User-Agent": USER_AGENT,
         },
     )
     try:
         with opener(request, timeout=timeout) as response:
             raw = response.read(MAX_INPUT_BYTES + 1)
     except urllib.error.HTTPError as exc:
+        exc.close()
         if exc.code in (401, 403):
             raise UsageError("auth_expired") from exc
         if exc.code == 429:
@@ -195,6 +359,50 @@ def fetch_claude(
         raise UsageError("bad_response") from exc
     if not isinstance(data, dict):
         raise UsageError("bad_response")
+    return data
+
+
+def fetch_claude(
+    account: dict[str, Any],
+    timeout: float,
+    *,
+    opener: Callable[..., Any] = open_without_redirects,
+) -> dict[str, Any]:
+    label = safe_label(account.get("label"), "Claude")
+    config_value = account.get("config_dir")
+    if not isinstance(config_value, str) or not config_value:
+        raise UsageError("invalid_config")
+
+    credentials_path = (expand_path(config_value) / ".credentials.json").resolve()
+    credentials = read_json(credentials_path)
+    oauth = claude_oauth(credentials)
+    access_token = oauth.get("accessToken")
+    if not isinstance(access_token, str) or not access_token:
+        raise UsageError("not_connected")
+    if not token_is_fresh(oauth, time.time() * 1000, skew_ms=CLAUDE_REFRESH_SKEW_MS):
+        credentials = refresh_claude_credentials(credentials_path, timeout, opener=opener)
+        oauth = claude_oauth(credentials)
+        access_token = oauth.get("accessToken")
+        if not isinstance(access_token, str) or not access_token:
+            raise UsageError("auth_expired")
+
+    try:
+        data = fetch_claude_usage_json(access_token, timeout, opener=opener)
+    except UsageError as exc:
+        if exc.code != "auth_expired":
+            raise
+        credentials = refresh_claude_credentials(
+            credentials_path,
+            timeout,
+            opener=opener,
+            force=True,
+            rejected_access_token=access_token,
+        )
+        refreshed_oauth = claude_oauth(credentials)
+        refreshed_token = refreshed_oauth.get("accessToken")
+        if not isinstance(refreshed_token, str) or not refreshed_token:
+            raise UsageError("auth_expired") from exc
+        data = fetch_claude_usage_json(refreshed_token, timeout, opener=opener)
     windows = parse_claude_usage(data)
     if not windows:
         raise UsageError("usage_unavailable")
@@ -425,7 +633,7 @@ def load_config(path: Path) -> dict[str, Any]:
                 raise UsageError("invalid_config")
             labels.add(label)
     timeout = config.get("timeout_seconds", 8)
-    refresh = config.get("refresh_seconds", 120)
+    refresh = config.get("refresh_seconds", 600)
     if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 60:
         raise UsageError("invalid_config")
     if not isinstance(refresh, (int, float)) or not 30 <= refresh <= 3600:
@@ -510,23 +718,7 @@ def bar_text(accounts: list[dict[str, Any]]) -> str:
 
 
 def write_cache(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    descriptor = os.open(temp, flags, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-        os.chmod(path, 0o600)
-    finally:
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
+    write_private_json(path, payload)
 
 
 def collect(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
@@ -554,7 +746,7 @@ def collect(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
     payload = {
         "schema": 1,
         "generated_at": iso_now(),
-        "refresh_seconds": int(config.get("refresh_seconds", 120)),
+        "refresh_seconds": int(config.get("refresh_seconds", 600)),
         "bar_text": bar_text(accounts),
         "accounts": accounts,
     }
