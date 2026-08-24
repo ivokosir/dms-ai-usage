@@ -258,6 +258,25 @@ PluginComponent {
         }
     }
 
+    component ProviderIcon: Item {
+        id: providerIconRoot
+
+        property string provider
+
+        width: Theme.iconSizeSmall
+        height: Theme.iconSizeSmall
+
+        Image {
+            anchors.fill: parent
+            source: Quickshell.iconPath(providerIconRoot.provider === "claude" ? "claude-desktop" : "chatgpt", true)
+            sourceSize.width: 32
+            sourceSize.height: 32
+            fillMode: Image.PreserveAspectFit
+            smooth: true
+            mipmap: true
+        }
+    }
+
     // Labeled numeral with a thin status meter underneath: "Fable 66%" over a 3px bar.
     component BarMetric: Column {
         id: metricRoot
@@ -407,10 +426,8 @@ PluginComponent {
                     spacing: Theme.spacingXS
                     anchors.verticalCenter: parent.verticalCenter
 
-                    DankIcon {
-                        name: "auto_awesome"
-                        size: Theme.iconSizeSmall
-                        color: Theme.surfaceVariantText
+                    ProviderIcon {
+                        provider: "claude"
                         anchors.verticalCenter: parent.verticalCenter
                     }
 
@@ -431,10 +448,8 @@ PluginComponent {
                     spacing: Theme.spacingXS
                     anchors.verticalCenter: parent.verticalCenter
 
-                    DankIcon {
-                        name: "terminal"
-                        size: Theme.iconSizeSmall
-                        color: Theme.surfaceVariantText
+                    ProviderIcon {
+                        provider: "codex"
                         anchors.verticalCenter: parent.verticalCenter
                     }
 
@@ -553,12 +568,10 @@ PluginComponent {
                                     width: parent.width
                                     height: Theme.iconSizeSmall
 
-                                    DankIcon {
+                                    ProviderIcon {
                                         id: claudeIcon
 
-                                        name: "auto_awesome"
-                                        size: Theme.iconSizeSmall
-                                        color: Theme.surfaceVariantText
+                                        provider: "claude"
                                         anchors.verticalCenter: parent.verticalCenter
                                         anchors.left: parent.left
                                     }
@@ -656,12 +669,10 @@ PluginComponent {
                                     width: parent.width
                                     height: Theme.iconSizeSmall
 
-                                    DankIcon {
+                                    ProviderIcon {
                                         id: codexIcon
 
-                                        name: "terminal"
-                                        size: Theme.iconSizeSmall
-                                        color: Theme.surfaceVariantText
+                                        provider: "codex"
                                         anchors.verticalCenter: parent.verticalCenter
                                         anchors.left: parent.left
                                     }
