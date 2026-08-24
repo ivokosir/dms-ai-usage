@@ -16,8 +16,8 @@ PluginComponent {
     property bool loadFailed: false
     property string collectorPath: Quickshell.env("HOME") + "/.local/bin/dms-ai-usage"
 
-    readonly property var claudeLive: accounts.filter(account => account.provider === "claude" && root.isConnected(account))
-    readonly property var codexLive: accounts.filter(account => account.provider === "codex" && root.isConnected(account))
+    readonly property var claudeLive: root.liveAccounts("claude")
+    readonly property var codexLive: root.liveAccounts("codex")
     readonly property var offlineAccounts: accounts.filter(account => !root.isConnected(account))
 
     function refreshUsage() {
@@ -47,6 +47,31 @@ PluginComponent {
     function isConnected(account) {
         return (account.status === "ok" || account.status === "stale")
             && root.windowsOf(account).length > 0
+    }
+
+    function accountOrder(account) {
+        const label = String(account && account.label || "").toLowerCase()
+        if (label.indexOf("gmail") !== -1)
+            return 0
+        if (label.indexOf("ffe") !== -1)
+            return 1
+        return 2
+    }
+
+    function liveAccounts(provider) {
+        return accounts
+            .filter(account => account.provider === provider && root.isConnected(account))
+            .sort((left, right) => root.accountOrder(left) - root.accountOrder(right))
+    }
+
+    function accountInitial(account) {
+        const label = String(account && account.label || "").trim()
+        const lower = label.toLowerCase()
+        if (lower.indexOf("gmail") !== -1)
+            return "G"
+        if (lower.indexOf("ffe") !== -1)
+            return "F"
+        return label.length > 0 ? label.charAt(0).toUpperCase() : "–"
     }
 
     // Accounts crossing a Repeater arrive as QVariantMaps: windows becomes a
@@ -378,63 +403,23 @@ PluginComponent {
 
                 delegate: Row {
                     required property var modelData
-                    required property int index
 
-                    spacing: Theme.spacingXS + 2
+                    spacing: Theme.spacingXS
                     anchors.verticalCenter: parent.verticalCenter
-                    opacity: modelData.status === "stale" ? 0.6 : 1
 
-                    Rectangle {
-                        visible: index > 0
-                        width: 1
-                        height: 12
-                        color: Theme.outlineLight
+                    DankIcon {
+                        name: "auto_awesome"
+                        size: Theme.iconSizeSmall
+                        color: Theme.surfaceVariantText
                         anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    Rectangle {
-                        visible: root.claudeLive.length > 1
-                        width: 13
-                        height: 13
-                        radius: 6.5
-                        color: Theme.withAlpha(Theme.surfaceVariantText, 0.2)
-                        anchors.verticalCenter: parent.verticalCenter
-
-                        StyledText {
-                            anchors.centerIn: parent
-                            text: String(index + 1)
-                            font.pixelSize: Theme.fontSizeSmall - 3
-                            font.weight: Font.DemiBold
-                            color: Theme.surfaceText
-                        }
                     }
 
                     BarMetric {
-                        // Short "F" only when two Claude accounts compete for bar width.
-                        label: {
-                            if (root.claudeLive.length > 1)
-                                return "F"
-                            const item = root.modelWindow(modelData)
-                            return item && item.label ? String(item.label) : "Fable"
-                        }
+                        label: root.accountInitial(modelData)
                         windowData: root.modelWindow(modelData)
                         anchors.verticalCenter: parent.verticalCenter
                     }
-
-                    BarMetric {
-                        label: "5h"
-                        windowData: root.labeledWindow(modelData, "5h")
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
                 }
-            }
-
-            Rectangle {
-                visible: root.claudeLive.length > 0 && root.codexLive.length > 0
-                width: 1
-                height: 16
-                color: Theme.outlineMedium
-                anchors.verticalCenter: parent.verticalCenter
             }
 
             Repeater {
@@ -445,32 +430,17 @@ PluginComponent {
 
                     spacing: Theme.spacingXS
                     anchors.verticalCenter: parent.verticalCenter
-                    opacity: modelData.status === "stale" ? 0.6 : 1
 
-                    CapacityRing {
-                        width: 14
-                        height: 14
-                        thickness: 2
-                        value: root.remainingOf(root.firstWindow(modelData))
-                        ringColor: root.statusColor(root.remainingOf(root.firstWindow(modelData)))
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    StyledText {
-                        text: {
-                            const item = root.firstWindow(modelData)
-                            return item && item.label ? String(item.label) : "–"
-                        }
-                        font.pixelSize: Theme.fontSizeSmall
+                    DankIcon {
+                        name: "terminal"
+                        size: Theme.iconSizeSmall
                         color: Theme.surfaceVariantText
                         anchors.verticalCenter: parent.verticalCenter
                     }
 
-                    StyledText {
-                        text: root.percentText(root.firstWindow(modelData))
-                        font.pixelSize: Theme.fontSizeSmall
-                        font.weight: Font.DemiBold
-                        color: Theme.surfaceText
+                    BarMetric {
+                        label: root.accountInitial(modelData)
+                        windowData: root.labeledWindow(modelData, "7d")
                         anchors.verticalCenter: parent.verticalCenter
                     }
                 }
@@ -497,7 +467,6 @@ PluginComponent {
                     required property var modelData
 
                     spacing: 1
-                    opacity: modelData.status === "stale" ? 0.6 : 1
                     anchors.horizontalCenter: parent.horizontalCenter
 
                     CapacityRing {
@@ -533,7 +502,6 @@ PluginComponent {
                     thickness: 2
                     value: root.remainingOf(root.firstWindow(modelData))
                     ringColor: root.statusColor(root.remainingOf(root.firstWindow(modelData)))
-                    opacity: modelData.status === "stale" ? 0.6 : 1
                     anchors.horizontalCenter: parent.horizontalCenter
                 }
             }
@@ -571,7 +539,6 @@ PluginComponent {
                             radius: Theme.cornerRadius
                             color: Theme.nestedSurface
                             implicitHeight: claudeColumn.implicitHeight + Theme.spacingS * 2
-                            opacity: modelData.status === "stale" ? 0.75 : 1
 
                             Column {
                                 id: claudeColumn
@@ -675,7 +642,6 @@ PluginComponent {
                             radius: Theme.cornerRadius
                             color: Theme.nestedSurface
                             implicitHeight: codexColumn.implicitHeight + Theme.spacingS * 2
-                            opacity: modelData.status === "stale" ? 0.75 : 1
 
                             Column {
                                 id: codexColumn
