@@ -74,6 +74,8 @@ Claude usage is fetched from Anthropic's OAuth usage endpoint using the credenti
 
 The default 10-minute polling interval keeps the bar current without hammering the experimental endpoint. Provider rate limits or network failures retain the last sanitized result as stale data.
 
+On multi-monitor setups, every bar reads the same locked cache. Simultaneous bars trigger only one provider refresh, while each screen receives the result.
+
 Codex usage is fetched through the official local [`codex app-server`](https://developers.openai.com/codex/app-server) method `account/rateLimits/read`. Codex owns its credential lifecycle.
 
 Anthropic's OAuth usage endpoint is not a documented public API and may change.

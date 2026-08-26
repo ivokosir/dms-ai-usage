@@ -24,7 +24,7 @@ CLAUDE_OAUTH_SCOPE = (
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 )
 CLAUDE_REFRESH_SKEW_MS = 5 * 60 * 1000
-USER_AGENT = "dms-ai-usage/0.2.0"
+USER_AGENT = "dms-ai-usage/0.2.1"
 MAX_INPUT_BYTES = 1_048_576
 
 
@@ -721,6 +721,20 @@ def write_cache(path: Path, payload: dict[str, Any]) -> None:
     write_private_json(path, payload)
 
 
+def cache_is_fresh(cache: dict[str, Any], max_age_seconds: float) -> bool:
+    generated_at = cache.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at:
+        return False
+    try:
+        parsed = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        return False
+    age = time.time() - parsed.timestamp()
+    return -5 <= age < max_age_seconds
+
+
 def collect(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
     timeout = float(config.get("timeout_seconds", 8))
     previous = load_cache(cache_path)
@@ -752,3 +766,23 @@ def collect(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
     }
     write_cache(cache_path, payload)
     return payload
+
+
+def collect_cached(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
+    """Share one provider refresh across simultaneous bar instances."""
+    lock_path = cache_path.with_name(f".{cache_path.name}.collect.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        cached = load_cache(cache_path)
+        refresh_seconds = float(config.get("refresh_seconds", 600))
+        if cache_is_fresh(cached, refresh_seconds):
+            return cached
+        return collect(config, cache_path)
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)

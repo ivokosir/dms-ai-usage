@@ -7,7 +7,10 @@ import tempfile
 import time
 import unittest
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -16,7 +19,9 @@ from dms_ai_usage.collector import (
     UsageError,
     account_result,
     bar_text,
+    collect_cached,
     fetch_claude,
+    iso_now,
     load_config,
     parse_claude_usage,
     parse_codex_rate_limits,
@@ -317,6 +322,48 @@ class StaleCacheTests(unittest.TestCase):
         result = stale_or_error(fresh, previous)
         self.assertEqual(result["status"], "stale")
         self.assertEqual([item["label"] for item in result["windows"]], ["Fable", "5h", "7d"])
+
+
+class SharedCacheTests(unittest.TestCase):
+    def test_simultaneous_bar_instances_share_one_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "usage.json"
+            call_count = 0
+            count_lock = Lock()
+
+            def fake_fetch(account: dict[str, object], _timeout: float) -> dict[str, object]:
+                nonlocal call_count
+                with count_lock:
+                    call_count += 1
+                time.sleep(0.05)
+                return account_result(
+                    "claude",
+                    str(account["label"]),
+                    "ok",
+                    windows=[
+                        {
+                            "id": "model:fable",
+                            "label": "Fable",
+                            "remaining_percent": 50,
+                        }
+                    ],
+                    updated_at=iso_now(),
+                )
+
+            config = {
+                "refresh_seconds": 600,
+                "claude": [{"label": "Test", "config_dir": str(directory)}],
+                "codex": [],
+            }
+            with patch("dms_ai_usage.collector.fetch_claude", side_effect=fake_fetch):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = list(
+                        executor.map(lambda _index: collect_cached(config, cache_path), range(2))
+                    )
+
+            self.assertEqual(call_count, 1)
+            self.assertEqual(results[0], results[1])
+            self.assertEqual(results[0]["accounts"][0]["status"], "ok")
 
 
 class OutputPrivacyTests(unittest.TestCase):

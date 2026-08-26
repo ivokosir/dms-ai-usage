@@ -22,8 +22,8 @@ PluginComponent {
 
     function refreshUsage() {
         Proc.runCommand(
-            "dmsAiUsage.collect",
-            [root.collectorPath],
+            null,
+            [root.collectorPath, "--cached"],
             (stdout, exitCode) => {
                 if (exitCode !== 0 && !stdout.trim()) {
                     root.loadFailed = true
