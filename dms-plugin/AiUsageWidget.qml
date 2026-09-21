@@ -76,7 +76,7 @@ PluginComponent {
 
     // Accounts crossing a Repeater arrive as QVariantMaps: windows becomes a
     // QVariantList, which fails Array.isArray. Iterate by length instead, and
-    // drop any Spark window defensively.
+    // drop hidden quotas defensively, including from an older cache.
     function windowsOf(account) {
         const raw = account ? account.windows : undefined
         if (!raw || typeof raw.length !== "number")
@@ -88,6 +88,9 @@ PluginComponent {
                 continue
             const text = (String(item.id || "") + " " + String(item.label || "")).toLowerCase()
             if (text.indexOf("spark") !== -1)
+                continue
+            if (account.provider === "codex"
+                    && (text.indexOf("gpt-reserve") !== -1 || text.indexOf("base_model_inference") !== -1))
                 continue
             result.push(item)
         }

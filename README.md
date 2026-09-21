@@ -2,7 +2,7 @@
 
 A small, local-first DankMaterialShell widget for multiple Claude and Codex subscriptions.
 
-The bar shows remaining capacity at a glance. Clicking it opens every available quota window, including Claude's model-scoped Fable limit.
+The bar shows remaining capacity at a glance. Clicking it opens the quota windows, including Claude's model-scoped Fable limit. Codex Spark and GPT reserve quotas are hidden.
 
 ## Why this stays small
 

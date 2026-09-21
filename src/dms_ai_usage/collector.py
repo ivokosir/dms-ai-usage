@@ -90,17 +90,17 @@ def make_window(window_id: str, label: str, used: Any, resets_at: Any = None) ->
     return result
 
 
-def is_spark_window(window: Any) -> bool:
+def is_hidden_codex_window(window: Any) -> bool:
     if not isinstance(window, dict):
         return True
     text = f"{window.get('id', '')} {window.get('label', '')}".lower()
-    return "spark" in text
+    return any(marker in text for marker in ("spark", "gpt-reserve", "base_model_inference"))
 
 
-def strip_spark_windows(windows: Any) -> list[dict[str, Any]]:
+def strip_hidden_codex_windows(windows: Any) -> list[dict[str, Any]]:
     if not isinstance(windows, list):
         return []
-    return [window for window in windows if not is_spark_window(window)]
+    return [window for window in windows if not is_hidden_codex_window(window)]
 
 
 def window_sort_key(provider: str, window: dict[str, Any]) -> int:
@@ -437,9 +437,8 @@ def parse_codex_rate_limits(result: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(limit_id, str) or not isinstance(bucket, dict):
             continue
         bucket_name = bucket.get("limitName")
-        # Spark buckets must never reach output or cache.
-        spark_text = f"{limit_id} {bucket_name if isinstance(bucket_name, str) else ''}".lower()
-        if "spark" in spark_text:
+        # Spark and GPT reserve buckets must never reach output or cache.
+        if is_hidden_codex_window({"id": limit_id, "label": bucket_name}):
             continue
         for slot, fallback in (("primary", "Primary"), ("secondary", "Secondary")):
             raw = bucket.get(slot)
@@ -460,7 +459,7 @@ def parse_codex_rate_limits(result: dict[str, Any]) -> list[dict[str, Any]]:
                     raw.get("resetsAt"),
                 )
             )
-    return order_windows("codex", strip_spark_windows(windows))
+    return order_windows("codex", strip_hidden_codex_windows(windows))
 
 
 class CodexRpcClient:
@@ -655,7 +654,7 @@ def stale_or_error(fresh: dict[str, Any], previous: dict[str, Any] | None) -> di
     if previous and previous.get("windows") and previous.get("provider") == fresh.get("provider"):
         provider = str(fresh["provider"])
         windows = previous.get("windows")
-        windows = strip_spark_windows(windows) if provider == "codex" else (
+        windows = strip_hidden_codex_windows(windows) if provider == "codex" else (
             [window for window in windows if isinstance(window, dict)] if isinstance(windows, list) else []
         )
         if not windows:
