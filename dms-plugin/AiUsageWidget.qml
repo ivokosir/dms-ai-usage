@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Shapes
 import Quickshell
 import qs.Common
 import qs.Widgets
@@ -14,6 +13,7 @@ PluginComponent {
     property string generatedAt: ""
     property int refreshSeconds: 600
     property bool loadFailed: false
+    property bool refreshInProgress: false
     property string collectorPath: Quickshell.env("HOME") + "/.local/bin/dms-ai-usage"
 
     readonly property var claudeLive: root.liveAccounts("claude")
@@ -21,10 +21,14 @@ PluginComponent {
     readonly property var offlineAccounts: accounts.filter(account => !root.isConnected(account))
 
     function refreshUsage() {
+        if (root.refreshInProgress)
+            return
+        root.refreshInProgress = true
         Proc.runCommand(
             null,
             [root.collectorPath, "--cached"],
             (stdout, exitCode) => {
+                root.refreshInProgress = false
                 if (exitCode !== 0 && !stdout.trim()) {
                     root.loadFailed = true
                     return
@@ -33,14 +37,16 @@ PluginComponent {
                     const payload = JSON.parse(stdout.trim())
                     root.accounts = Array.isArray(payload.accounts) ? payload.accounts : []
                     root.generatedAt = payload.generated_at || ""
-                    root.loadFailed = false
+                    root.loadFailed = exitCode !== 0 || Boolean(payload.error)
                     if (payload.refresh_seconds >= 30)
                         root.refreshSeconds = payload.refresh_seconds
                 } catch (error) {
                     root.loadFailed = true
                 }
             },
-            100
+            100,
+            -1, // The collector bounds provider requests and SSH itself.
+            root
         )
     }
 
@@ -92,22 +98,13 @@ PluginComponent {
             if (account.provider === "codex"
                     && (text.indexOf("gpt-reserve") !== -1 || text.indexOf("base_model_inference") !== -1))
                 continue
+            if (account.provider === "codex" && item.label !== "7d")
+                continue
+            if (account.provider === "claude" && item.id !== "five_hour" && item.id !== "seven_day")
+                continue
             result.push(item)
         }
         return result
-    }
-
-    function modelWindow(account) {
-        const windows = root.windowsOf(account)
-        for (const item of windows) {
-            if (String(item.id || "").indexOf("model:") === 0)
-                return item
-        }
-        for (const item of windows) {
-            if (String(item.label || "").toLowerCase().indexOf("fable") !== -1)
-                return item
-        }
-        return null
     }
 
     function labeledWindow(account, label) {
@@ -116,11 +113,6 @@ PluginComponent {
                 return item
         }
         return null
-    }
-
-    function firstWindow(account) {
-        const windows = root.windowsOf(account)
-        return windows.length > 0 ? windows[0] : null
     }
 
     // remaining_percent may be a QVariant-wrapped number; Number() + isFinite
@@ -133,16 +125,6 @@ PluginComponent {
             return -1
         const value = Number(raw)
         return isFinite(value) ? value : -1
-    }
-
-    function worstClaudeRemaining(account) {
-        const fable = root.remainingOf(root.modelWindow(account))
-        const five = root.remainingOf(root.labeledWindow(account, "5h"))
-        if (fable < 0)
-            return five
-        if (five < 0)
-            return fable
-        return Math.min(fable, five)
     }
 
     function percentText(item) {
@@ -162,7 +144,7 @@ PluginComponent {
 
     function statusText(account) {
         if (account.status === "ok")
-            return "live"
+            return ""
         if (account.status === "stale")
             return "stale"
         return (account.error || "not connected").replace(/_/g, " ")
@@ -172,7 +154,19 @@ PluginComponent {
         return account && account.provider === "claude" ? "Claude" : "Codex"
     }
 
-    // Language-neutral countdown ("in 57m", "in 5d 17h"). Reading generatedAt
+    // Shortest window first, named the way Claude's own /usage names them.
+    function limitsOf(account) {
+        const result = []
+        const session = root.labeledWindow(account, "5h")
+        const week = root.labeledWindow(account, "7d")
+        if (session)
+            result.push({ name: "Session", data: session })
+        if (week)
+            result.push({ name: "Week", data: week })
+        return result
+    }
+
+    // Language-neutral countdown ("57m", "5d 17h"). Reading generatedAt
     // makes bindings recompute on every collector refresh.
     function resetIn(item) {
         const refreshTick = root.generatedAt
@@ -189,63 +183,11 @@ PluginComponent {
         if (minutes <= 0)
             return "now"
         if (minutes < 60)
-            return "in " + minutes + "m"
+            return minutes + "m"
         const hours = Math.floor(minutes / 60)
         if (hours < 24)
-            return "in " + hours + "h " + (minutes % 60) + "m"
-        return "in " + Math.floor(hours / 24) + "d " + (hours % 24) + "h"
-    }
-
-    function captionWithReset(caption, item, fallbackItem) {
-        let reset = root.resetIn(item)
-        if (!reset)
-            reset = root.resetIn(fallbackItem)
-        return reset ? caption + " · " + reset : caption
-    }
-
-    component CapacityRing: Item {
-        id: ringRoot
-
-        property real value: -1
-        property real thickness: 3
-        property color ringColor: Theme.primary
-
-        Shape {
-            anchors.fill: parent
-            preferredRendererType: Shape.CurveRenderer
-
-            ShapePath {
-                strokeWidth: ringRoot.thickness
-                strokeColor: Theme.withAlpha(ringRoot.ringColor, 0.18)
-                fillColor: "transparent"
-                capStyle: ShapePath.RoundCap
-
-                PathAngleArc {
-                    centerX: ringRoot.width / 2
-                    centerY: ringRoot.height / 2
-                    radiusX: ringRoot.width / 2 - ringRoot.thickness / 2
-                    radiusY: ringRoot.height / 2 - ringRoot.thickness / 2
-                    startAngle: 0
-                    sweepAngle: 360
-                }
-            }
-
-            ShapePath {
-                strokeWidth: ringRoot.thickness
-                strokeColor: ringRoot.value >= 0 ? ringRoot.ringColor : "transparent"
-                fillColor: "transparent"
-                capStyle: ShapePath.RoundCap
-
-                PathAngleArc {
-                    centerX: ringRoot.width / 2
-                    centerY: ringRoot.height / 2
-                    radiusX: ringRoot.width / 2 - ringRoot.thickness / 2
-                    radiusY: ringRoot.height / 2 - ringRoot.thickness / 2
-                    startAngle: -90
-                    sweepAngle: 360 * Math.max(0, Math.min(100, ringRoot.value)) / 100
-                }
-            }
-        }
+            return hours + "h " + (minutes % 60) + "m"
+        return Math.floor(hours / 24) + "d " + (hours % 24) + "h"
     }
 
     component CapacityMeter: Rectangle {
@@ -253,10 +195,11 @@ PluginComponent {
 
         property real value: -1
         property color meterColor: Theme.primary
+        property color trackColor: Theme.withAlpha(meterColor, 0.18)
 
         height: 6
         radius: height / 2
-        color: Theme.withAlpha(meterColor, 0.18)
+        color: trackColor
 
         Rectangle {
             width: meterRoot.value >= 0
@@ -287,29 +230,27 @@ PluginComponent {
         }
     }
 
-    // Labeled numeral with a thin status meter underneath: "Fable 66%" over a 3px bar.
+    // Keep each account compact: provider + initial above its weekly meter.
     component BarMetric: Column {
         id: metricRoot
 
-        property string label
-        property var windowData
+        property var account
+        readonly property var windowData: root.labeledWindow(account, "7d")
 
         spacing: 3
 
         Row {
             id: metricRow
 
-            spacing: 4
+            spacing: 3
 
-            StyledText {
-                text: metricRoot.label
-                font.pixelSize: Theme.fontSizeSmall
-                color: Theme.surfaceVariantText
+            ProviderIcon {
+                provider: metricRoot.account.provider
                 anchors.verticalCenter: parent.verticalCenter
             }
 
             StyledText {
-                text: root.percentText(metricRoot.windowData)
+                text: root.accountInitial(metricRoot.account)
                 font.pixelSize: Theme.fontSizeSmall
                 font.weight: Font.DemiBold
                 color: Theme.surfaceText
@@ -325,85 +266,129 @@ PluginComponent {
         }
     }
 
-    component RingStat: Column {
-        id: statRoot
+    // One quota per line, laid out as a table: name, meter, percent, reset.
+    component LimitRow: Row {
+        id: limitRoot
 
+        property string name
         property var windowData
-        property string caption
+        readonly property real remaining: root.remainingOf(windowData)
 
-        spacing: Theme.spacingXS
-
-        Item {
-            width: 64
-            height: 64
-            anchors.horizontalCenter: parent.horizontalCenter
-
-            CapacityRing {
-                anchors.fill: parent
-                thickness: 5
-                value: root.remainingOf(statRoot.windowData)
-                ringColor: root.statusColor(root.remainingOf(statRoot.windowData))
-            }
-
-            StyledText {
-                anchors.centerIn: parent
-                text: root.percentText(statRoot.windowData)
-                font.pixelSize: Theme.fontSizeLarge
-                font.weight: Font.DemiBold
-                color: Theme.surfaceText
-            }
-        }
+        spacing: Theme.spacingM
 
         StyledText {
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: {
-                const reset = root.resetIn(statRoot.windowData)
-                return reset ? statRoot.caption + " · " + reset : statRoot.caption
-            }
+            width: 48
+            text: limitRoot.name
             font.pixelSize: Theme.fontSizeSmall
             color: Theme.surfaceVariantText
-        }
-    }
-
-    component CompactStat: Column {
-        id: compactStatRoot
-
-        property var windowData
-        property string caption
-
-        spacing: 3
-
-        Row {
-            width: parent.width
-
-            StyledText {
-                id: compactCaption
-
-                text: compactStatRoot.caption
-                font.pixelSize: Theme.fontSizeSmall
-                color: Theme.surfaceVariantText
-            }
-
-            Item {
-                width: Math.max(0, parent.width - compactCaption.implicitWidth - compactValue.implicitWidth)
-                height: 1
-            }
-
-            StyledText {
-                id: compactValue
-
-                text: root.percentText(compactStatRoot.windowData)
-                font.pixelSize: Theme.fontSizeSmall
-                font.weight: Font.DemiBold
-                color: Theme.surfaceText
-            }
+            anchors.verticalCenter: parent.verticalCenter
         }
 
         CapacityMeter {
+            width: limitRoot.width - 48 - 36 - 52 - limitRoot.spacing * 3
+            height: 4
+            value: limitRoot.remaining
+            meterColor: root.statusColor(limitRoot.remaining)
+            trackColor: Theme.withAlpha(Theme.surfaceText, 0.08)
+            anchors.verticalCenter: parent.verticalCenter
+        }
+
+        StyledText {
+            width: 36
+            text: root.percentText(limitRoot.windowData)
+            font.pixelSize: Theme.fontSizeSmall
+            font.features: { "tnum": 1 }
+            color: Theme.surfaceText
+            horizontalAlignment: Text.AlignRight
+            anchors.verticalCenter: parent.verticalCenter
+        }
+
+        StyledText {
+            width: 52
+            text: root.resetIn(limitRoot.windowData)
+            font.pixelSize: Theme.fontSizeSmall
+            font.features: { "tnum": 1 }
+            color: Theme.surfaceVariantText
+            horizontalAlignment: Text.AlignRight
+            anchors.verticalCenter: parent.verticalCenter
+        }
+    }
+
+    component AccountSection: Column {
+        id: sectionRoot
+
+        property var account
+        readonly property bool connected: root.isConnected(account)
+        readonly property string status: root.statusText(account)
+
+        spacing: Theme.spacingS
+
+        Item {
             width: parent.width
-            height: 3
-            value: root.remainingOf(compactStatRoot.windowData)
-            meterColor: root.statusColor(root.remainingOf(compactStatRoot.windowData))
+            height: Math.max(Theme.iconSizeSmall, providerText.implicitHeight)
+            opacity: sectionRoot.connected ? 1 : 0.6
+
+            ProviderIcon {
+                id: sectionIcon
+
+                provider: sectionRoot.account.provider
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+            }
+
+            StyledText {
+                id: providerText
+
+                text: root.providerName(sectionRoot.account)
+                font.pixelSize: Theme.fontSizeMedium
+                font.weight: Font.Medium
+                color: Theme.surfaceText
+                anchors.left: sectionIcon.right
+                anchors.leftMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+            }
+
+            StyledText {
+                text: sectionRoot.account.label
+                font.pixelSize: Theme.fontSizeMedium
+                color: Theme.surfaceVariantText
+                elide: Text.ElideRight
+                anchors.left: providerText.right
+                anchors.leftMargin: Theme.spacingS
+                anchors.right: statusLabel.left
+                anchors.rightMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+            }
+
+            StyledText {
+                id: statusLabel
+
+                text: sectionRoot.status
+                font.pixelSize: Theme.fontSizeSmall
+                color: sectionRoot.account.status === "stale" ? Theme.warning : Theme.surfaceVariantText
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+            }
+        }
+
+        // Indented so quota names line up under the provider name.
+        Column {
+            visible: sectionRoot.connected
+            x: Theme.iconSizeSmall + Theme.spacingS
+            width: parent.width - x
+            spacing: Theme.spacingXS + 2
+
+            Repeater {
+                model: sectionRoot.connected ? root.limitsOf(sectionRoot.account) : []
+
+                delegate: LimitRow {
+                    required property var modelData
+
+                    width: parent.width
+                    name: modelData.name
+                    windowData: modelData.data
+                }
+            }
         }
     }
 
@@ -428,46 +413,13 @@ PluginComponent {
             }
 
             Repeater {
-                model: root.claudeLive
+                model: root.claudeLive.concat(root.codexLive)
 
-                delegate: Row {
+                delegate: BarMetric {
                     required property var modelData
 
-                    spacing: Theme.spacingXS
+                    account: modelData
                     anchors.verticalCenter: parent.verticalCenter
-
-                    ProviderIcon {
-                        provider: "claude"
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    BarMetric {
-                        label: root.accountInitial(modelData)
-                        windowData: root.modelWindow(modelData)
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-            }
-
-            Repeater {
-                model: root.codexLive
-
-                delegate: Row {
-                    required property var modelData
-
-                    spacing: Theme.spacingXS
-                    anchors.verticalCenter: parent.verticalCenter
-
-                    ProviderIcon {
-                        provider: "codex"
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-
-                    BarMetric {
-                        label: root.accountInitial(modelData)
-                        windowData: root.labeledWindow(modelData, "7d")
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
                 }
             }
         }
@@ -486,47 +438,12 @@ PluginComponent {
             }
 
             Repeater {
-                model: root.claudeLive
+                model: root.claudeLive.concat(root.codexLive)
 
-                delegate: Column {
+                delegate: BarMetric {
                     required property var modelData
 
-                    spacing: 1
-                    anchors.horizontalCenter: parent.horizontalCenter
-
-                    CapacityRing {
-                        width: 18
-                        height: 18
-                        thickness: 2.5
-                        value: root.worstClaudeRemaining(modelData)
-                        ringColor: root.statusColor(root.worstClaudeRemaining(modelData))
-                        anchors.horizontalCenter: parent.horizontalCenter
-                    }
-
-                    StyledText {
-                        text: {
-                            const remaining = root.worstClaudeRemaining(modelData)
-                            return remaining < 0 ? "–" : String(Math.round(remaining))
-                        }
-                        font.pixelSize: Theme.fontSizeSmall - 2
-                        font.weight: Font.DemiBold
-                        color: Theme.surfaceText
-                        anchors.horizontalCenter: parent.horizontalCenter
-                    }
-                }
-            }
-
-            Repeater {
-                model: root.codexLive
-
-                delegate: CapacityRing {
-                    required property var modelData
-
-                    width: 14
-                    height: 14
-                    thickness: 2
-                    value: root.remainingOf(root.firstWindow(modelData))
-                    ringColor: root.statusColor(root.remainingOf(root.firstWindow(modelData)))
+                    account: modelData
                     anchors.horizontalCenter: parent.horizontalCenter
                 }
             }
@@ -537,296 +454,40 @@ PluginComponent {
         PopoutComponent {
             id: popout
 
-            headerText: "AI usage"
-            detailsText: "Remaining capacity"
-            showCloseButton: true
-
             Item {
                 width: parent.width
-                implicitHeight: root.popoutHeight - popout.headerHeight - popout.detailsHeight - Theme.spacingXL
-                clip: true
+                implicitHeight: contentColumn.implicitHeight + Theme.spacingS * 2
 
                 Column {
                     id: contentColumn
 
-                    width: parent.width
-                    spacing: Theme.spacingS
+                    readonly property var sections: root.claudeLive.concat(root.codexLive, root.offlineAccounts)
+
+                    x: Theme.spacingS
+                    y: Theme.spacingS
+                    width: parent.width - Theme.spacingS * 2
 
                     Repeater {
-                        model: root.claudeLive
+                        model: contentColumn.sections
 
-                        delegate: StyledRect {
-                            id: claudeCard
-
+                        delegate: Column {
                             required property var modelData
+                            required property int index
 
                             width: parent.width
-                            radius: Theme.cornerRadius
-                            color: Theme.nestedSurface
-                            implicitHeight: claudeColumn.implicitHeight + Theme.spacingS * 2
 
-                            Column {
-                                id: claudeColumn
-
-                                anchors.top: parent.top
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.margins: Theme.spacingS
-                                spacing: Theme.spacingXS
-
-                                Item {
-                                    width: parent.width
-                                    height: Theme.iconSizeSmall
-
-                                    ProviderIcon {
-                                        id: claudeIcon
-
-                                        provider: "claude"
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.left: parent.left
-                                    }
-
-                                    StyledText {
-                                        id: claudeProvider
-
-                                        text: "Claude"
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceVariantText
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.left: claudeIcon.right
-                                        anchors.leftMargin: Theme.spacingXS
-                                    }
-
-                                    StyledText {
-                                        text: "· " + claudeCard.modelData.label
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        font.weight: Font.DemiBold
-                                        color: Theme.surfaceText
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.left: claudeProvider.right
-                                        anchors.leftMargin: 3
-                                    }
-
-                                    Rectangle {
-                                        width: 7
-                                        height: 7
-                                        radius: 3.5
-                                        color: claudeCard.modelData.status === "ok" ? Theme.success : Theme.warning
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.right: claudeSecondary.left
-                                        anchors.rightMargin: Theme.spacingXS
-                                    }
-
-                                    StyledText {
-                                        id: claudeSecondary
-
-                                        text: {
-                                            if (claudeCard.modelData.status !== "ok")
-                                                return root.statusText(claudeCard.modelData)
-                                            const seven = root.labeledWindow(claudeCard.modelData, "7d")
-                                            return seven ? "7d " + root.percentText(seven) : ""
-                                        }
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceVariantText
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.right: parent.right
-                                    }
-                                }
-
-                                Row {
-                                    width: parent.width
-                                    spacing: Theme.spacingM
-
-                                    CompactStat {
-                                        width: (parent.width - parent.spacing) / 2
-                                        windowData: root.modelWindow(claudeCard.modelData)
-                                        caption: root.captionWithReset(
-                                            windowData && windowData.label ? String(windowData.label) : "Fable",
-                                            windowData,
-                                            root.labeledWindow(claudeCard.modelData, "7d")
-                                        )
-                                    }
-
-                                    CompactStat {
-                                        width: (parent.width - parent.spacing) / 2
-                                        windowData: root.labeledWindow(claudeCard.modelData, "5h")
-                                        caption: root.captionWithReset("5h", windowData, null)
-                                    }
-                                }
+                            Rectangle {
+                                visible: index > 0
+                                width: parent.width
+                                height: 1
+                                color: Theme.withAlpha(Theme.outline, 0.2)
                             }
-                        }
-                    }
 
-                    Repeater {
-                        model: root.codexLive
-
-                        delegate: StyledRect {
-                            id: codexCard
-
-                            required property var modelData
-
-                            width: parent.width
-                            radius: Theme.cornerRadius
-                            color: Theme.nestedSurface
-                            implicitHeight: codexColumn.implicitHeight + Theme.spacingS * 2
-
-                            Column {
-                                id: codexColumn
-
-                                anchors.top: parent.top
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.margins: Theme.spacingS
-                                spacing: Theme.spacingXS
-
-                                Item {
-                                    width: parent.width
-                                    height: Theme.iconSizeSmall
-
-                                    ProviderIcon {
-                                        id: codexIcon
-
-                                        provider: "codex"
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.left: parent.left
-                                    }
-
-                                    StyledText {
-                                        id: codexProvider
-
-                                        text: "Codex"
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceVariantText
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.left: codexIcon.right
-                                        anchors.leftMargin: Theme.spacingXS
-                                    }
-
-                                    StyledText {
-                                        text: "· " + codexCard.modelData.label
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        font.weight: Font.DemiBold
-                                        color: Theme.surfaceText
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.left: codexProvider.right
-                                        anchors.leftMargin: 3
-                                    }
-
-                                    Rectangle {
-                                        width: 7
-                                        height: 7
-                                        radius: 3.5
-                                        color: codexCard.modelData.status === "ok" ? Theme.success : Theme.warning
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.right: codexState.visible ? codexState.left : parent.right
-                                        anchors.rightMargin: codexState.visible ? Theme.spacingXS : 0
-                                    }
-
-                                    StyledText {
-                                        id: codexState
-
-                                        visible: codexCard.modelData.status !== "ok"
-                                        text: root.statusText(codexCard.modelData)
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceVariantText
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.right: parent.right
-                                    }
-                                }
-
-                                Repeater {
-                                    model: root.windowsOf(codexCard.modelData)
-
-                                    delegate: Row {
-                                        required property var modelData
-
-                                        width: parent.width
-                                        spacing: Theme.spacingS
-
-                                        StyledText {
-                                        width: 32
-                                            text: modelData.label
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            color: Theme.surfaceVariantText
-                                            elide: Text.ElideRight
-                                            anchors.verticalCenter: parent.verticalCenter
-                                        }
-
-                                        CapacityMeter {
-                                            width: parent.width - 32 - 44 - 88 - Theme.spacingS * 3
-                                            height: 3
-                                            value: root.remainingOf(modelData)
-                                            meterColor: root.statusColor(root.remainingOf(modelData))
-                                            anchors.verticalCenter: parent.verticalCenter
-                                        }
-
-                                        StyledText {
-                                            width: 44
-                                            text: root.percentText(modelData)
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            font.weight: Font.DemiBold
-                                            color: Theme.surfaceText
-                                            horizontalAlignment: Text.AlignRight
-                                            anchors.verticalCenter: parent.verticalCenter
-                                        }
-
-                                        StyledText {
-                                            width: 88
-                                            text: root.resetIn(modelData)
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            color: Theme.surfaceVariantText
-                                            elide: Text.ElideRight
-                                            anchors.verticalCenter: parent.verticalCenter
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Repeater {
-                        model: root.offlineAccounts
-
-                        delegate: StyledRect {
-                            id: offlineRow
-
-                            required property var modelData
-
-                            width: parent.width
-                            height: 34
-                            radius: Theme.cornerRadius
-                            color: Theme.nestedSurface
-
-                            Row {
-                                anchors.left: parent.left
-                                anchors.leftMargin: Theme.spacingM
-                                anchors.verticalCenter: parent.verticalCenter
-                                spacing: Theme.spacingS
-
-                                Rectangle {
-                                    width: 8
-                                    height: 8
-                                    radius: 4
-                                    color: "transparent"
-                                    border.width: 1
-                                    border.color: Theme.outlineStrong
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-
-                                StyledText {
-                                    text: root.providerName(offlineRow.modelData) + " · " + offlineRow.modelData.label
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    font.weight: Font.DemiBold
-                                    color: Theme.surfaceText
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
-
-                                StyledText {
-                                    text: root.statusText(offlineRow.modelData)
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    color: Theme.surfaceVariantText
-                                    anchors.verticalCenter: parent.verticalCenter
-                                }
+                            AccountSection {
+                                width: parent.width
+                                account: modelData
+                                topPadding: index > 0 ? Theme.spacingM : 0
+                                bottomPadding: index < contentColumn.sections.length - 1 ? Theme.spacingM : 0
                             }
                         }
                     }
@@ -838,10 +499,16 @@ PluginComponent {
                         color: Theme.surfaceVariantText
                     }
                 }
+
+                MouseArea {
+                    anchors.fill: parent
+                    anchors.margins: -Theme.spacingS
+                    acceptedButtons: Qt.AllButtons
+                    onClicked: root.closePopout()
+                }
             }
         }
     }
 
-    popoutWidth: 380
-    popoutHeight: 350
+    popoutWidth: 360
 }
