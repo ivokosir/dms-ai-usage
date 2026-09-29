@@ -5,6 +5,7 @@ import http.client
 import json
 import math
 import os
+import re
 import selectors
 import shutil
 import signal
@@ -100,18 +101,21 @@ def is_hidden_codex_window(window: Any) -> bool:
 def strip_hidden_codex_windows(windows: Any) -> list[dict[str, Any]]:
     if not isinstance(windows, list):
         return []
-    return [window for window in windows if not is_hidden_codex_window(window)]
+    return [window for window in windows if not is_hidden_codex_window(window)
+            and window.get("label") == "7d"]
+
+
+def visible_windows(provider: str, windows: Any) -> list[dict[str, Any]]:
+    if provider == "codex":
+        return strip_hidden_codex_windows(windows)
+    if not isinstance(windows, list):
+        return []
+    return [window for window in windows if isinstance(window, dict)
+            and window.get("id") in ("five_hour", "seven_day")]
 
 
 def window_sort_key(provider: str, window: dict[str, Any]) -> int:
     label = str(window.get("label", "")).lower()
-    if provider == "claude":
-        # Weekly-scoped model windows (Fable) first, then 5h, then 7d.
-        if label == "5h":
-            return 1
-        if label == "7d":
-            return 2
-        return 0
     if label == "5h" or label.endswith(" 5h"):
         return 0
     if label == "7d" or label.endswith(" 7d"):
@@ -130,27 +134,6 @@ def parse_claude_usage(data: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(raw, dict) and raw.get("utilization") is not None:
             windows.append(make_window(key, label, raw["utilization"], raw.get("resets_at")))
 
-    limits = data.get("limits")
-    if isinstance(limits, list):
-        for index, limit in enumerate(limits):
-            if not isinstance(limit, dict) or limit.get("kind") != "weekly_scoped":
-                continue
-            scope = limit.get("scope")
-            model = scope.get("model") if isinstance(scope, dict) else None
-            name = model.get("display_name") if isinstance(model, dict) else None
-            if not isinstance(name, str) or not name or len(name) > 40:
-                continue
-            if limit.get("percent") is None:
-                continue
-            safe_name = "".join(char.lower() if char.isalnum() else "-" for char in name).strip("-")
-            windows.append(
-                make_window(
-                    f"model:{safe_name or index}",
-                    name,
-                    limit["percent"],
-                    limit.get("resets_at"),
-                )
-            )
     return order_windows("claude", windows)
 
 
@@ -436,6 +419,8 @@ def parse_codex_rate_limits(result: dict[str, Any]) -> list[dict[str, Any]]:
     for limit_id, bucket in ordered:
         if not isinstance(limit_id, str) or not isinstance(bucket, dict):
             continue
+        if limit_id != "codex":
+            continue
         bucket_name = bucket.get("limitName")
         # Spark and GPT reserve buckets must never reach output or cache.
         if is_hidden_codex_window({"id": limit_id, "label": bucket_name}):
@@ -443,6 +428,8 @@ def parse_codex_rate_limits(result: dict[str, Any]) -> list[dict[str, Any]]:
         for slot, fallback in (("primary", "Primary"), ("secondary", "Secondary")):
             raw = bucket.get(slot)
             if not isinstance(raw, dict) or raw.get("usedPercent") is None:
+                continue
+            if raw.get("windowDurationMins") != 10_080:
                 continue
             fingerprint = (raw.get("windowDurationMins"), raw.get("resetsAt"), raw.get("usedPercent"))
             if fingerprint in seen:
@@ -631,6 +618,22 @@ def load_config(path: Path) -> dict[str, Any]:
             if label in labels:
                 raise UsageError("invalid_config")
             labels.add(label)
+            if "proxy_auth_file" in account:
+                name = account["proxy_auth_file"]
+                if not isinstance(name, str) or not name or len(name) > 255:
+                    raise UsageError("invalid_config")
+                if not isinstance(config.get("cliproxyapi"), dict):
+                    raise UsageError("invalid_config")
+    proxy = config.get("cliproxyapi")
+    if proxy is not None:
+        if not isinstance(proxy, dict):
+            raise UsageError("invalid_config")
+        host = proxy.get("ssh_host")
+        key_file = proxy.get("management_key_file")
+        if (not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]*", host)
+                or not isinstance(key_file, str) or not key_file
+                or not isinstance(proxy.get("base_url", ""), str)):
+            raise UsageError("invalid_config")
     timeout = config.get("timeout_seconds", 8)
     refresh = config.get("refresh_seconds", 600)
     if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 60:
@@ -645,7 +648,16 @@ def load_cache(path: Path) -> dict[str, Any]:
         data = read_json(path)
     except UsageError:
         return {}
-    return data if data.get("schema") == 1 else {}
+    if data.get("schema") != 1:
+        return {}
+    accounts = data.get("accounts")
+    if not isinstance(accounts, list):
+        return {}
+    for account in accounts:
+        if isinstance(account, dict):
+            account["windows"] = visible_windows(account.get("provider", ""), account.get("windows"))
+    data["bar_text"] = bar_text([item for item in accounts if isinstance(item, dict)])
+    return data
 
 
 def stale_or_error(fresh: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
@@ -654,9 +666,7 @@ def stale_or_error(fresh: dict[str, Any], previous: dict[str, Any] | None) -> di
     if previous and previous.get("windows") and previous.get("provider") == fresh.get("provider"):
         provider = str(fresh["provider"])
         windows = previous.get("windows")
-        windows = strip_hidden_codex_windows(windows) if provider == "codex" else (
-            [window for window in windows if isinstance(window, dict)] if isinstance(windows, list) else []
-        )
+        windows = visible_windows(provider, windows)
         if not windows:
             return fresh
         return account_result(
@@ -677,11 +687,7 @@ def window_remaining(account: dict[str, Any], wanted: str) -> int | None:
     for window in windows:
         if not isinstance(window, dict):
             continue
-        window_id = str(window.get("id", "")).lower()
-        label = str(window.get("label", "")).lower()
-        if wanted == "fable" and "fable" not in window_id and "fable" not in label:
-            continue
-        if wanted != "fable" and window.get("label") != wanted:
+        if window.get("label") != wanted:
             continue
         remaining = window.get("remaining_percent")
         if isinstance(remaining, (int, float)):
@@ -698,21 +704,14 @@ def bar_text(accounts: list[dict[str, Any]]) -> str:
             continue
         counters[provider] += 1
         prefix = ("C" if provider == "claude" else "X") + str(counters[provider])
-        five = window_remaining(account, "5h")
+        seven = window_remaining(account, "7d")
+        seven_text = "–" if seven is None else str(seven)
         if provider == "claude":
-            fable = window_remaining(account, "fable")
+            five = window_remaining(account, "5h")
             five_text = "–" if five is None else str(five)
-            fable_text = "–" if fable is None else str(fable)
-            parts.append(f"{prefix} {five_text}/F{fable_text}")
+            parts.append(f"{prefix} 5h {five_text}/7d {seven_text}")
         else:
-            primary = five
-            if primary is None:
-                windows = account.get("windows")
-                if isinstance(windows, list) and windows:
-                    first = windows[0]
-                    value = first.get("remaining_percent") if isinstance(first, dict) else None
-                    primary = int(round(value)) if isinstance(value, (int, float)) else None
-            parts.append(f"{prefix} {'–' if primary is None else primary}")
+            parts.append(f"{prefix} 7d {seven_text}")
     return " · ".join(parts) if parts else "AI –"
 
 
@@ -734,6 +733,72 @@ def cache_is_fresh(cache: dict[str, Any], max_age_seconds: float) -> bool:
     return -5 <= age < max_age_seconds
 
 
+def fetch_proxy_accounts(config: dict[str, Any], timeout: float) -> dict[tuple[str, str], dict[str, Any]]:
+    configured = [dict(account, provider=provider, label=safe_label(account.get("label"), provider.title()))
+                  for provider in ("claude", "codex") for account in config.get(provider, [])
+                  if "proxy_auth_file" in account]
+    if not configured:
+        return {}
+    proxy = config.get("cliproxyapi", {})
+    options = dict(proxy, timeout_seconds=timeout, accounts=[
+        {key: account[key] for key in ("provider", "label", "proxy_auth_file")}
+        for account in configured
+    ])
+    source = Path(__file__).with_name("proxy.py").read_text()
+    script = source + "\nprint(json.dumps(collect_proxy(json.loads(" + repr(json.dumps(options)) + "))))\n"
+    try:
+        process = subprocess.run(
+            ["ssh", "-T", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={int(timeout)}",
+             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+             "--", proxy["ssh_host"], "python3 -"],
+            input=script, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=(len(configured) + 1) * timeout + 10,
+        )
+        if process.returncode:
+            raise UsageError("proxy_unavailable")
+        if len(process.stdout) > MAX_INPUT_BYTES:
+            raise UsageError("bad_response")
+        payload = json.loads(process.stdout)
+        if not isinstance(payload, dict):
+            raise UsageError("bad_response")
+    except subprocess.TimeoutExpired:
+        payload = {"error": "timeout"}
+    except OSError:
+        payload = {"error": "proxy_unavailable"}
+    except (ValueError, UnicodeError):
+        payload = {"error": "bad_response"}
+    except UsageError as exc:
+        payload = {"error": exc.code}
+
+    results = {}
+    remote = payload.get("accounts", [])
+    if not isinstance(remote, list):
+        remote = []
+    for account in configured:
+        provider, label = account["provider"], account["label"]
+        matches = [item for item in remote if isinstance(item, dict)
+                   and item.get("provider") == provider and item.get("label") == label]
+        try:
+            if payload.get("error"):
+                raise UsageError(str(payload["error"]))
+            if len(matches) != 1:
+                raise UsageError("bad_response")
+            item = matches[0]
+            if item.get("error"):
+                raise UsageError(str(item["error"]))
+            data = item.get("usage")
+            if not isinstance(data, dict):
+                raise UsageError("bad_response")
+            windows = parse_claude_usage(data) if provider == "claude" else parse_codex_rate_limits(data)
+            if not windows:
+                raise UsageError("usage_unavailable")
+            result = account_result(provider, label, "ok", windows=windows, updated_at=iso_now())
+        except UsageError as exc:
+            result = account_result(provider, label, "error", error=exc.code)
+        results[(provider, label)] = result
+    return results
+
+
 def collect(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
     timeout = float(config.get("timeout_seconds", 8))
     previous = load_cache(cache_path)
@@ -743,6 +808,7 @@ def collect(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
         if isinstance(item, dict)
     }
     accounts: list[dict[str, Any]] = []
+    proxy_accounts = fetch_proxy_accounts(config, timeout)
     for provider, fetcher in (("claude", fetch_claude), ("codex", fetch_codex)):
         configured = config.get(provider, [])
         for raw_account in configured:
@@ -750,7 +816,7 @@ def collect(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
                 raw_account = {}
             label = safe_label(raw_account.get("label"), provider.title())
             try:
-                result = fetcher(raw_account, timeout)
+                result = proxy_accounts[(provider, label)] if "proxy_auth_file" in raw_account else fetcher(raw_account, timeout)
             except UsageError as exc:
                 result = account_result(provider, label, "error", error=exc.code)
             prior = previous_accounts.get((provider, label))

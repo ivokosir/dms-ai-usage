@@ -47,7 +47,7 @@ class JsonResponse:
 
 
 class ClaudeParserTests(unittest.TestCase):
-    def test_fable_is_separate_and_first(self) -> None:
+    def test_only_five_hour_and_weekly_are_kept(self) -> None:
         windows = parse_claude_usage(
             {
                 "five_hour": {"utilization": 20, "resets_at": "2026-08-24T01:00:00Z"},
@@ -62,8 +62,8 @@ class ClaudeParserTests(unittest.TestCase):
                 ],
             }
         )
-        self.assertEqual([item["label"] for item in windows], ["Fable", "5h", "7d"])
-        self.assertEqual(windows[0]["remaining_percent"], 45)
+        self.assertEqual([item["label"] for item in windows], ["5h", "7d"])
+        self.assertEqual(windows[0]["remaining_percent"], 80)
 
 
 class ClaudeRefreshTests(unittest.TestCase):
@@ -221,7 +221,7 @@ class ClaudeRefreshTests(unittest.TestCase):
 
 
 class CodexParserTests(unittest.TestCase):
-    def test_primary_and_secondary(self) -> None:
+    def test_only_weekly_secondary_is_kept(self) -> None:
         windows = parse_codex_rate_limits(
             {
                 "rateLimits": {
@@ -230,10 +230,10 @@ class CodexParserTests(unittest.TestCase):
                 }
             }
         )
-        self.assertEqual([item["label"] for item in windows], ["5h", "7d"])
-        self.assertEqual(windows[0]["remaining_percent"], 75)
+        self.assertEqual([item["label"] for item in windows], ["7d"])
+        self.assertEqual(windows[0]["remaining_percent"], 40)
 
-    def test_windows_are_ordered_five_hour_first(self) -> None:
+    def test_weekly_primary_is_kept(self) -> None:
         windows = parse_codex_rate_limits(
             {
                 "rateLimits": {
@@ -242,7 +242,7 @@ class CodexParserTests(unittest.TestCase):
                 }
             }
         )
-        self.assertEqual([item["label"] for item in windows], ["5h", "7d"])
+        self.assertEqual([item["label"] for item in windows], ["7d"])
 
     def test_spark_buckets_are_dropped(self) -> None:
         windows = parse_codex_rate_limits(
@@ -260,7 +260,7 @@ class CodexParserTests(unittest.TestCase):
                 }
             }
         )
-        self.assertEqual([item["label"] for item in windows], ["5h", "7d"])
+        self.assertEqual([item["label"] for item in windows], ["7d"])
         for window in windows:
             self.assertNotIn("spark", f"{window['id']} {window['label']}".lower())
 
@@ -294,7 +294,7 @@ class StaleCacheTests(unittest.TestCase):
         )
         result = stale_or_error(fresh, previous)
         self.assertEqual(result["status"], "stale")
-        self.assertEqual([item["label"] for item in result["windows"]], ["5h", "7d"])
+        self.assertEqual([item["label"] for item in result["windows"]], ["7d"])
 
     def test_stale_with_only_spark_windows_becomes_error(self) -> None:
         fresh = account_result("codex", "Codex 1", "error", error="network_error")
@@ -321,7 +321,7 @@ class StaleCacheTests(unittest.TestCase):
         )
         result = stale_or_error(fresh, previous)
         self.assertEqual(result["status"], "stale")
-        self.assertEqual([item["label"] for item in result["windows"]], ["Fable", "5h", "7d"])
+        self.assertEqual([item["label"] for item in result["windows"]], ["5h", "7d"])
 
 
 class SharedCacheTests(unittest.TestCase):
@@ -342,8 +342,8 @@ class SharedCacheTests(unittest.TestCase):
                     "ok",
                     windows=[
                         {
-                            "id": "model:fable",
-                            "label": "Fable",
+                            "id": "seven_day",
+                            "label": "7d",
                             "remaining_percent": 50,
                         }
                     ],
@@ -389,7 +389,7 @@ class OutputPrivacyTests(unittest.TestCase):
     def test_cache_contains_only_sanitized_input(self) -> None:
         payload = {
             "schema": 1,
-            "bar_text": "C1 80/F45",
+            "bar_text": "C1 5h 80/7d 45",
             "accounts": [
                 account_result(
                     "claude",
@@ -415,17 +415,17 @@ class OutputPrivacyTests(unittest.TestCase):
                 "ok",
                 windows=[
                     {"id": "five_hour", "label": "5h", "remaining_percent": 80},
-                    {"id": "model:fable", "label": "Fable", "remaining_percent": 45},
+                    {"id": "seven_day", "label": "7d", "remaining_percent": 45},
                 ],
             ),
             account_result(
                 "codex",
                 "Codex 1",
                 "ok",
-                windows=[{"id": "codex:primary", "label": "5h", "remaining_percent": 75}],
+                windows=[{"id": "codex:primary", "label": "7d", "remaining_percent": 75}],
             ),
         ]
-        self.assertEqual(bar_text(accounts), "C1 80/F45 · X1 75")
+        self.assertEqual(bar_text(accounts), "C1 5h 80/7d 45 · X1 7d 75")
 
     def test_compact_bar_unaffected_by_window_order(self) -> None:
         accounts = [
@@ -434,12 +434,12 @@ class OutputPrivacyTests(unittest.TestCase):
                 "Claude 1",
                 "ok",
                 windows=[
-                    {"id": "model:fable", "label": "Fable", "remaining_percent": 45},
+                    {"id": "seven_day", "label": "7d", "remaining_percent": 45},
                     {"id": "five_hour", "label": "5h", "remaining_percent": 80},
                 ],
             )
         ]
-        self.assertEqual(bar_text(accounts), "C1 80/F45")
+        self.assertEqual(bar_text(accounts), "C1 5h 80/7d 45")
 
 
 if __name__ == "__main__":
