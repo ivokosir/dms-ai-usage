@@ -1,24 +1,9 @@
 {
   "refresh_seconds": 600,
   "timeout_seconds": 8,
-  "claude": [
-    {
-      "label": "Personal",
-      "config_dir": "~/ai-subscriptions/claude-personal"
-    },
-    {
-      "label": "Work",
-      "config_dir": "~/ai-subscriptions/claude-work"
-    }
-  ],
-  "codex": [
-    {
-      "label": "Personal",
-      "home": "~/ai-subscriptions/codex-personal"
-    },
-    {
-      "label": "Work",
-      "home": "~/ai-subscriptions/codex-work"
-    }
-  ]
+  "cliproxyapi": {
+    "ssh_host": "my-server",
+    "base_url": "http://127.0.0.1:8317",
+    "management_key_file": "~/.config/cliproxyapi/management.key"
+  }
 }

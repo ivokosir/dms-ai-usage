@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import http.client
+import hashlib
 import json
 import math
 import os
@@ -606,6 +607,8 @@ def account_result(
 
 def load_config(path: Path) -> dict[str, Any]:
     config = read_json(path)
+    if not isinstance(config.get("cliproxyapi"), dict):
+        raise UsageError("invalid_config")
     for key in ("claude", "codex"):
         value = config.get(key, [])
         if not isinstance(value, list) or len(value) > 20:
@@ -618,6 +621,8 @@ def load_config(path: Path) -> dict[str, Any]:
             if label in labels:
                 raise UsageError("invalid_config")
             labels.add(label)
+            if "proxy_auth_file" not in account or "home" in account or "config_dir" in account:
+                raise UsageError("invalid_config")
             if "proxy_auth_file" in account:
                 name = account["proxy_auth_file"]
                 if not isinstance(name, str) or not name or len(name) > 255:
@@ -627,6 +632,8 @@ def load_config(path: Path) -> dict[str, Any]:
     proxy = config.get("cliproxyapi")
     if proxy is not None:
         if not isinstance(proxy, dict):
+            raise UsageError("invalid_config")
+        if not isinstance(proxy.get("discover_accounts", True), bool):
             raise UsageError("invalid_config")
         host = proxy.get("ssh_host")
         key_file = proxy.get("management_key_file")
@@ -719,6 +726,12 @@ def write_cache(path: Path, payload: dict[str, Any]) -> None:
     write_private_json(path, payload)
 
 
+def source_fingerprint(config: dict[str, Any]) -> str:
+    """Keep private connection details out of cache while separating proxy sources."""
+    source = {key: config.get(key) for key in ("cliproxyapi", "claude", "codex")}
+    return hashlib.sha256(json.dumps(source, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def cache_is_fresh(cache: dict[str, Any], max_age_seconds: float) -> bool:
     generated_at = cache.get("generated_at")
     if not isinstance(generated_at, str) or not generated_at:
@@ -733,14 +746,16 @@ def cache_is_fresh(cache: dict[str, Any], max_age_seconds: float) -> bool:
     return -5 <= age < max_age_seconds
 
 
-def fetch_proxy_accounts(config: dict[str, Any], timeout: float) -> dict[tuple[str, str], dict[str, Any]]:
+def fetch_proxy_accounts(config: dict[str, Any], timeout: float,
+                         previous: list[dict[str, Any]] | None = None) -> dict[tuple[str, str], dict[str, Any]]:
     configured = [dict(account, provider=provider, label=safe_label(account.get("label"), provider.title()))
                   for provider in ("claude", "codex") for account in config.get(provider, [])
                   if "proxy_auth_file" in account]
-    if not configured:
-        return {}
     proxy = config.get("cliproxyapi", {})
-    options = dict(proxy, timeout_seconds=timeout, accounts=[
+    discover = bool(proxy) and proxy.get("discover_accounts", True)
+    if not configured and not discover:
+        return {}
+    options = dict(proxy, discover_accounts=discover, timeout_seconds=timeout, accounts=[
         {key: account[key] for key in ("provider", "label", "proxy_auth_file")}
         for account in configured
     ])
@@ -752,7 +767,7 @@ def fetch_proxy_accounts(config: dict[str, Any], timeout: float) -> dict[tuple[s
              "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
              "--", proxy["ssh_host"], "python3 -"],
             input=script, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=(len(configured) + 1) * timeout + 10,
+            timeout=((51 if discover else len(configured) + 1) * timeout) + 10,
         )
         if process.returncode:
             raise UsageError("proxy_unavailable")
@@ -774,7 +789,26 @@ def fetch_proxy_accounts(config: dict[str, Any], timeout: float) -> dict[tuple[s
     remote = payload.get("accounts", [])
     if not isinstance(remote, list):
         remote = []
-    for account in configured:
+    selected = configured
+    if discover:
+        valid = (isinstance(payload.get("accounts"), list)
+                 and all(isinstance(a, dict) and a.get("provider") in ("claude", "codex")
+                         and isinstance(a.get("label"), str) and 0 < len(a["label"]) <= 40
+                         and isinstance(a.get("account_id"), str)
+                         and re.fullmatch(r"[a-f0-9]{24}", a["account_id"])
+                         for a in remote)
+                 and len({a["account_id"] for a in remote}) == len(remote)
+                 and len({(a["provider"], a["label"]) for a in remote}) == len(remote))
+        if not payload.get("error") and not valid:
+            payload = {"error": "bad_response"}
+        if payload.get("error"):
+            # Retain discovered accounts during outages, including their stable IDs.
+            selected = list(previous or configured)
+            if not selected:
+                raise UsageError(str(payload["error"]))
+        else:
+            selected = remote
+    for account in selected:
         provider, label = account["provider"], account["label"]
         matches = [item for item in remote if isinstance(item, dict)
                    and item.get("provider") == provider and item.get("label") == label]
@@ -795,6 +829,12 @@ def fetch_proxy_accounts(config: dict[str, Any], timeout: float) -> dict[tuple[s
             result = account_result(provider, label, "ok", windows=windows, updated_at=iso_now())
         except UsageError as exc:
             result = account_result(provider, label, "error", error=exc.code)
+        if "account_id" in account:
+            result["account_id"] = account["account_id"]
+        email = matches[0].get("email") if len(matches) == 1 else account.get("email")
+        if (isinstance(email, str) and "@" in email and len(email) <= 254
+                and not any(c.isspace() or ord(c) < 32 for c in email)):
+            result["email"] = email
         results[(provider, label)] = result
     return results
 
@@ -802,26 +842,42 @@ def fetch_proxy_accounts(config: dict[str, Any], timeout: float) -> dict[tuple[s
 def collect(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
     timeout = float(config.get("timeout_seconds", 8))
     previous = load_cache(cache_path)
+    if config.get("cliproxyapi") and previous.get("source_fingerprint") != source_fingerprint(config):
+        previous = {}
     previous_accounts = {
         (item.get("provider"), item.get("label")): item
         for item in previous.get("accounts", [])
         if isinstance(item, dict)
     }
     accounts: list[dict[str, Any]] = []
-    proxy_accounts = fetch_proxy_accounts(config, timeout)
-    for provider, fetcher in (("claude", fetch_claude), ("codex", fetch_codex)):
-        configured = config.get(provider, [])
-        for raw_account in configured:
-            if not isinstance(raw_account, dict):
-                raw_account = {}
-            label = safe_label(raw_account.get("label"), provider.title())
-            try:
-                result = proxy_accounts[(provider, label)] if "proxy_auth_file" in raw_account else fetcher(raw_account, timeout)
-            except UsageError as exc:
-                result = account_result(provider, label, "error", error=exc.code)
-            prior = previous_accounts.get((provider, label))
-            accounts.append(stale_or_error(result, prior))
-
+    if config.get("cliproxyapi"):
+        proxy_accounts = fetch_proxy_accounts(config, timeout, previous.get("accounts", []))
+        previous_by_id = {a["account_id"]: a for a in previous.get("accounts", [])
+                          if isinstance(a, dict) and isinstance(a.get("account_id"), str)}
+        for result in proxy_accounts.values():
+            account_id = result.get("account_id")
+            prior = (previous_by_id.get(account_id) if account_id else
+                     previous_accounts.get((result["provider"], result["label"])))
+            account = stale_or_error(result, prior)
+            if account_id:
+                account["account_id"] = account_id
+            if result.get("email"):
+                account["email"] = result["email"]
+            accounts.append(account)
+    else:
+        proxy_accounts = fetch_proxy_accounts(config, timeout)
+        for provider, fetcher in (("claude", fetch_claude), ("codex", fetch_codex)):
+            configured = config.get(provider, [])
+            for raw_account in configured:
+                if not isinstance(raw_account, dict):
+                    raw_account = {}
+                label = safe_label(raw_account.get("label"), provider.title())
+                try:
+                    result = proxy_accounts[(provider, label)] if "proxy_auth_file" in raw_account else fetcher(raw_account, timeout)
+                except UsageError as exc:
+                    result = account_result(provider, label, "error", error=exc.code)
+                prior = previous_accounts.get((provider, label))
+                accounts.append(stale_or_error(result, prior))
     payload = {
         "schema": 1,
         "generated_at": iso_now(),
@@ -829,6 +885,8 @@ def collect(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
         "bar_text": bar_text(accounts),
         "accounts": accounts,
     }
+    if config.get("cliproxyapi"):
+        payload["source_fingerprint"] = source_fingerprint(config)
     write_cache(cache_path, payload)
     return payload
 
@@ -843,7 +901,9 @@ def collect_cached(config: dict[str, Any], cache_path: Path) -> dict[str, Any]:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         cached = load_cache(cache_path)
         refresh_seconds = float(config.get("refresh_seconds", 600))
-        if cache_is_fresh(cached, refresh_seconds):
+        same_source = (not config.get("cliproxyapi")
+                       or cached.get("source_fingerprint") == source_fingerprint(config))
+        if same_source and cache_is_fresh(cached, refresh_seconds):
             return cached
         return collect(config, cache_path)
     finally:

@@ -1,22 +1,12 @@
 # DMS AI Usage
 
-A small, local-first DankMaterialShell widget for multiple Claude and Codex subscriptions.
+A small DankMaterialShell widget for Claude and Codex subscriptions managed by your own CLIProxyAPI server.
 
-The bar shows each provider icon and account initial above a small weekly capacity meter, without percentage text. Clicking it shows Claude's five-hour and weekly limits, and Codex's weekly limit. Model-specific limits (including Fable), Codex five-hour, Spark, and GPT reserve quotas are hidden. The popup sizes itself to its account rows, has no header, and closes when clicked inside or outside.
-
-## Why this stays small
-
-- No account swapping or routing.
-- No daemon and no inference requests.
-- No third-party Python packages.
-- Optional CLIProxyAPI connection over SSH keeps login credentials on the server.
-- Claude profiles remain normal `CLAUDE_CONFIG_DIR` directories.
-- Codex profiles remain normal `CODEX_HOME` directories.
-- The cache contains only labels, percentages, and reset times.
+The bar shows one provider icon per discovered subscription, without account names. The popup shows each provider icon with the full account email and usage beneath it. Accounts whose usage cannot be loaded stay visible; the popup explains their status. Claude's popup shows five-hour and weekly limits; Codex shows its weekly limit. Model-specific quotas are hidden.
 
 ## Install
 
-Requirements: Python 3.11+, Claude Code, Codex CLI, and DankMaterialShell 1.5+.
+Requirements: Python 3.11+ on your desktop and proxy server, DankMaterialShell 1.5+, SSH access without interactive prompts, and CLIProxyAPI with its management API enabled.
 
 ```bash
 git clone https://github.com/ivokosir/dms-ai-usage.git
@@ -26,56 +16,9 @@ cd dms-ai-usage
 
 Edit `~/.config/dms-ai-usage/config.json`, then enable **AI Usage** in DMS Settings → Plugins and add `dmsAiUsage` to a DankBar.
 
-Reload without restarting the shell:
+## Connect your proxy
 
-```bash
-dms ipc call plugin-scan scan
-dms ipc call plugins enable dmsAiUsage
-dms ipc call plugin-scan reload dmsAiUsage
-```
-
-## Configure accounts
-
-For local CLI accounts, put labels and profile directories in the configuration file:
-
-```json
-{
-  "refresh_seconds": 600,
-  "timeout_seconds": 8,
-  "claude": [
-    {"label": "Personal", "config_dir": "~/ai-subscriptions/claude-personal"},
-    {"label": "Work", "config_dir": "~/ai-subscriptions/claude-work"}
-  ],
-  "codex": [
-    {"label": "Personal", "home": "~/ai-subscriptions/codex-personal"},
-    {"label": "Work", "home": "~/ai-subscriptions/codex-work"}
-  ]
-}
-```
-
-Each extra profile needs a one-time login:
-
-```bash
-mkdir -p "$HOME/ai-subscriptions/claude-work" "$HOME/ai-subscriptions/codex-work"
-CLAUDE_CONFIG_DIR="$HOME/ai-subscriptions/claude-work" claude auth login
-CODEX_HOME="$HOME/ai-subscriptions/codex-work" codex login
-```
-
-This widget only displays usage. It never switches accounts or sends prompts.
-
-Run a manual check:
-
-```bash
-dms-ai-usage --pretty
-```
-
-## Use accounts already connected to CLIProxyAPI
-
-If CLIProxyAPI already keeps your subscriptions connected on a server, the widget can use those accounts instead of maintaining another set of local logins. This uses the management API's `GET /v0/management/auth-files` and `POST /v0/management/api-call`, the same quota endpoints used by its management panel. The proxy's `/usage` statistics count proxy requests; they are not subscription capacity.
-
-Requirements: SSH access without interactive prompts, Python 3.11+ on the server, and the existing CLIProxyAPI **management key** in a private text file on that server. A client API key will not work. Store the key with file mode `0600`; do not put it in the widget configuration.
-
-For example, start with [config.proxy.example.json](config.proxy.example.json):
+The installed example uses placeholders. Replace them locally; never commit your real configuration or credentials.
 
 ```json
 {
@@ -85,35 +28,47 @@ For example, start with [config.proxy.example.json](config.proxy.example.json):
     "ssh_host": "my-server",
     "base_url": "http://127.0.0.1:8317",
     "management_key_file": "~/.config/cliproxyapi/management.key"
-  },
-  "claude": [
-    {"label": "Personal", "proxy_auth_file": "claude-personal.json"}
-  ],
-  "codex": [
-    {"label": "Personal", "proxy_auth_file": "codex-personal.json"}
-  ]
+  }
 }
 ```
 
-Use your SSH alias and the exact auth-file names shown by the proxy's management panel. The key-file path and base URL are resolved on the server. HTTP is allowed only for loopback addresses; use HTTPS for any other host. The widget sends a small Python worker over one SSH connection per refresh. No helper installation or extra server is needed. Only the requested percentages and reset times come back; keys and provider account details stay on the server.
+All Claude and Codex accounts in CLIProxyAPI are discovered at every refresh, including disabled or disconnected accounts. Adding or removing a subscription in the proxy updates the widget on its next poll. Other provider types are not currently supported.
 
-An account with `proxy_auth_file` uses the proxy exclusively, so it never refreshes or overwrites local CLI credentials. Local and proxy accounts can coexist in the same configuration. The proxy owns token renewal; if an account becomes disconnected there, reconnect it in the proxy. Connection failures retain the last reading with a `stale` status, and the next scheduled poll tries again.
+No account lists or friendly names are required. The popup uses the email returned by CLIProxyAPI, with a neutral **Account 1** fallback when no email is available. Auth filenames stay on the proxy server. Stable account identifiers and a fingerprint of the proxy configuration prevent cached usage from being assigned to another account or server.
 
-## Authentication behavior
+Optional `claude` and `codex` arrays can provide fallback labels or select accounts when discovery is disabled, using the exact auth-file names from your proxy's management panel:
 
-For local profiles, Claude usage is fetched from Anthropic's OAuth usage endpoint using the credentials already owned by Claude Code. Access tokens expire after several hours, so the widget refreshes one shortly before expiry and retries once after an authentication failure. Anthropic rotates refresh tokens; both new tokens are therefore saved together to the same profile with an atomic mode-`0600` write. A per-profile lock prevents two widget processes from refreshing the same token at once, and a concurrent update from Claude Code is never overwritten.
+```json
+"claude": [{"label": "Personal", "proxy_auth_file": "claude-personal.json"}],
+"codex": [{"label": "Work", "proxy_auth_file": "codex-work.json"}]
+```
 
-The default 10-minute polling interval keeps the bar current without hammering the experimental endpoint. Provider rate limits or network failures retain the last sanitized result as stale data.
+These are aliases, not an allowlist: unlisted accounts are still discovered. Keep real aliases in your private configuration. Labels must be unique within each provider. For an intentionally restricted widget, set `cliproxyapi.discover_accounts` to `false` and supply explicit account lists.
 
-On multi-monitor setups, every bar reads the same locked cache. Simultaneous bars trigger only one provider refresh, while each screen receives the result. The widget lets the collector enforce its own request timeouts instead of terminating it at the shell's default ten-second limit.
+Store the existing CLIProxyAPI **management key** in the specified private text file on the server, with mode `0600`. A client API key will not work. The key-file path and base URL are resolved on the server. HTTP is accepted only for loopback addresses; use HTTPS for other hosts. The desktop needs no copy of the management key or provider tokens, and no public API port is needed.
 
-For local profiles, Codex usage is fetched through the official local [`codex app-server`](https://developers.openai.com/codex/app-server) method `account/rateLimits/read`. Codex owns its credential lifecycle.
+The widget sends a small Python worker over one SSH connection per refresh. It reads `GET /v0/management/auth-files` and uses `POST /v0/management/api-call` to obtain subscription quotas. No helper installation or extra server is needed. Proxy `/usage` request counts are not subscription capacity.
+
+This widget's configuration requires CLIProxyAPI accounts. Local `CLAUDE_CONFIG_DIR` and `CODEX_HOME` profiles are not supported by the widget. The proxy owns token renewal; reconnect expired subscriptions there.
+
+## Refresh and troubleshooting
+
+```bash
+dms-ai-usage --pretty
+dms ipc call plugin-scan scan
+dms ipc call plugins enable dmsAiUsage
+dms ipc call plugin-scan reload dmsAiUsage
+```
+
+The default polling interval is ten minutes. Network and provider failures retain the last sanitized reading with a stale status. Accounts without a previous reading remain in the bar and popup, so an expired subscription does not disappear. Multiple bars share a locked cache and trigger only one refresh.
 
 The provider quota endpoints used by CLIProxyAPI are not documented public APIs and may change. See CLIProxyAPI's [API-call handler](https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/api/handlers/management/api_tools.go) and the management panel's [quota endpoints](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/main/src/utils/quota/constants.ts).
 
 ## Privacy
 
-Credentials, emails, absolute profile paths, and raw provider responses are never written to the cache or printed. Refresh tokens are sent only to Anthropic's token endpoint and never leave their source profile on disk. The cache is created with mode `0600` under `~/.cache/dms-ai-usage/usage.json`.
+Management keys and provider credentials stay on the proxy server. Account emails are intentionally returned for local popup display and included in the private cache and CLI output. Display labels, opaque account identifiers, quota numbers, reset times, and sanitized statuses also return. Management keys, provider credentials, auth filenames, and raw provider responses are never returned or cached. Do not publish live CLI output or screenshots containing account emails. The cache is mode `0600` under `~/.cache/dms-ai-usage/usage.json`.
+
+Real configuration lives outside this repository. Both committed example files contain placeholders. Local configuration, usage caches, environment files, private keys, and UI captures are ignored by Git. Review staged changes before publishing; ignore rules cannot remove data from earlier commits.
 
 ## Development
 
@@ -121,12 +76,6 @@ Credentials, emails, absolute profile paths, and raw provider responses are neve
 python3 -m unittest discover -s tests -v
 ```
 
-Capture the real widget after an edit:
-
-```bash
-./scripts/capture-ui.sh /tmp/dms-ai-usage-preview
-```
-
-This reloads DMS and saves cropped `bar.ui.png` and `popout.ui.png` images without touching the clipboard or storing a full desktop screenshot. It currently requires niri, jq, and ImageMagick.
+The optional `scripts/capture-ui.sh` captures cropped widget previews locally. Do not commit captures containing personal account labels.
 
 MIT licensed.

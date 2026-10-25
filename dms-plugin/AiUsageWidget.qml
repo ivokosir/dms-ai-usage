@@ -16,9 +16,7 @@ PluginComponent {
     property bool refreshInProgress: false
     property string collectorPath: Quickshell.env("HOME") + "/.local/bin/dms-ai-usage"
 
-    readonly property var claudeLive: root.liveAccounts("claude")
-    readonly property var codexLive: root.liveAccounts("codex")
-    readonly property var offlineAccounts: accounts.filter(account => !root.isConnected(account))
+    readonly property var sortedAccounts: root.providerAccounts("claude").concat(root.providerAccounts("codex"))
 
     function refreshUsage() {
         if (root.refreshInProgress)
@@ -50,34 +48,27 @@ PluginComponent {
         )
     }
 
+    function isReachable(account) {
+        return account.status === "ok" || account.status === "stale"
+    }
+
     function isConnected(account) {
-        return (account.status === "ok" || account.status === "stale")
-            && root.windowsOf(account).length > 0
+        return root.isReachable(account) && root.windowsOf(account).length > 0
     }
 
-    function accountOrder(account) {
-        const label = String(account && account.label || "").toLowerCase()
-        if (label.indexOf("gmail") !== -1)
-            return 0
-        if (label.indexOf("ffe") !== -1)
-            return 1
-        return 2
-    }
-
-    function liveAccounts(provider) {
-        return accounts
-            .filter(account => account.provider === provider && root.isConnected(account))
-            .sort((left, right) => root.accountOrder(left) - root.accountOrder(right))
-    }
-
-    function accountInitial(account) {
+    // Full email when the collector knows it, else its neutral label.
+    function displayName(account) {
+        const email = String(account && account.email || "").trim()
+        if (email.length > 0)
+            return email
         const label = String(account && account.label || "").trim()
-        const lower = label.toLowerCase()
-        if (lower.indexOf("gmail") !== -1)
-            return "G"
-        if (lower.indexOf("ffe") !== -1)
-            return "F"
-        return label.length > 0 ? label.charAt(0).toUpperCase() : "–"
+        return label.length > 0 ? label : "Unnamed account"
+    }
+
+    function providerAccounts(provider) {
+        return accounts
+            .filter(account => account.provider === provider)
+            .sort((left, right) => root.displayName(left).localeCompare(root.displayName(right)))
     }
 
     // Accounts crossing a Repeater arrive as QVariantMaps: windows becomes a
@@ -144,14 +135,12 @@ PluginComponent {
 
     function statusText(account) {
         if (account.status === "ok")
-            return ""
+            return root.windowsOf(account).length > 0 ? "" : "no usage data"
         if (account.status === "stale")
             return "stale"
-        return (account.error || "not connected").replace(/_/g, " ")
-    }
-
-    function providerName(account) {
-        return account && account.provider === "claude" ? "Claude" : "Codex"
+        const status = String(account.status || "unavailable").replace(/_/g, " ")
+        const error = String(account.error || "").replace(/_/g, " ")
+        return error.length > 0 && error !== status ? status + " · " + error : status
     }
 
     // Shortest window first, named the way Claude's own /usage names them.
@@ -215,9 +204,10 @@ PluginComponent {
         id: providerIconRoot
 
         property string provider
+        property real size: Theme.iconSizeSmall
 
-        width: Theme.iconSizeSmall
-        height: Theme.iconSizeSmall
+        width: size
+        height: size
 
         Image {
             anchors.fill: parent
@@ -230,40 +220,12 @@ PluginComponent {
         }
     }
 
-    // Keep each account compact: provider + initial above its weekly meter.
-    component BarMetric: Column {
-        id: metricRoot
-
+    // The bar shows only which subscriptions exist; quota lives in the popout.
+    component BarIcon: ProviderIcon {
         property var account
-        readonly property var windowData: root.labeledWindow(account, "7d")
 
-        spacing: 3
-
-        Row {
-            id: metricRow
-
-            spacing: 3
-
-            ProviderIcon {
-                provider: metricRoot.account.provider
-                anchors.verticalCenter: parent.verticalCenter
-            }
-
-            StyledText {
-                text: root.accountInitial(metricRoot.account)
-                font.pixelSize: Theme.fontSizeSmall
-                font.weight: Font.DemiBold
-                color: Theme.surfaceText
-                anchors.verticalCenter: parent.verticalCenter
-            }
-        }
-
-        CapacityMeter {
-            width: metricRow.width
-            height: 3
-            value: root.remainingOf(metricRoot.windowData)
-            meterColor: root.statusColor(root.remainingOf(metricRoot.windowData))
-        }
+        provider: account.provider
+        opacity: root.isReachable(account) ? 1 : 0.4
     }
 
     // One quota per line, laid out as a table: name, meter, percent, reset.
@@ -321,57 +283,53 @@ PluginComponent {
         readonly property bool connected: root.isConnected(account)
         readonly property string status: root.statusText(account)
 
-        spacing: Theme.spacingS
+        spacing: Theme.spacingXS + 2
 
-        Item {
+        // Emails wrap anywhere so the full address is always readable.
+        Row {
             width: parent.width
-            height: Math.max(Theme.iconSizeSmall, providerText.implicitHeight)
-            opacity: sectionRoot.connected ? 1 : 0.6
+            spacing: Theme.spacingS
+            opacity: root.isReachable(sectionRoot.account) ? 1 : 0.6
 
             ProviderIcon {
                 id: sectionIcon
 
                 provider: sectionRoot.account.provider
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
+                y: Math.max(0, (nameText.lineHeightPx - height) / 2)
             }
 
-            StyledText {
-                id: providerText
+            Column {
+                width: parent.width - sectionIcon.width - parent.spacing
+                spacing: 1
 
-                text: root.providerName(sectionRoot.account)
-                font.pixelSize: Theme.fontSizeMedium
-                font.weight: Font.Medium
-                color: Theme.surfaceText
-                anchors.left: sectionIcon.right
-                anchors.leftMargin: Theme.spacingS
-                anchors.verticalCenter: parent.verticalCenter
-            }
+                StyledText {
+                    id: nameText
 
-            StyledText {
-                text: sectionRoot.account.label
-                font.pixelSize: Theme.fontSizeMedium
-                color: Theme.surfaceVariantText
-                elide: Text.ElideRight
-                anchors.left: providerText.right
-                anchors.leftMargin: Theme.spacingS
-                anchors.right: statusLabel.left
-                anchors.rightMargin: Theme.spacingS
-                anchors.verticalCenter: parent.verticalCenter
-            }
+                    readonly property real lineHeightPx: font.pixelSize * 1.3
 
-            StyledText {
-                id: statusLabel
+                    width: parent.width
+                    text: root.displayName(sectionRoot.account)
+                    textFormat: Text.PlainText
+                    font.pixelSize: Theme.fontSizeMedium
+                    font.weight: Font.Medium
+                    color: Theme.surfaceText
+                    wrapMode: Text.WrapAnywhere
+                }
 
-                text: sectionRoot.status
-                font.pixelSize: Theme.fontSizeSmall
-                color: sectionRoot.account.status === "stale" ? Theme.warning : Theme.surfaceVariantText
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
+                StyledText {
+                    visible: sectionRoot.status.length > 0
+                    width: parent.width
+                    text: sectionRoot.status
+                    textFormat: Text.PlainText
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: sectionRoot.account.status === "stale" ? Theme.warning
+                        : root.isReachable(sectionRoot.account) ? Theme.surfaceVariantText : Theme.error
+                    wrapMode: Text.Wrap
+                }
             }
         }
 
-        // Indented so quota names line up under the provider name.
+        // Indented so quota names line up under the email.
         Column {
             visible: sectionRoot.connected
             x: Theme.iconSizeSmall + Theme.spacingS
@@ -402,10 +360,10 @@ PluginComponent {
 
     horizontalBarPill: Component {
         Row {
-            spacing: Theme.spacingS
+            spacing: Theme.spacingXS + 2
 
             DankIcon {
-                visible: root.claudeLive.length === 0 && root.codexLive.length === 0
+                visible: root.sortedAccounts.length === 0
                 name: "data_usage"
                 size: Theme.iconSize - 6
                 color: root.loadFailed ? Theme.error : Theme.surfaceVariantText
@@ -413,9 +371,9 @@ PluginComponent {
             }
 
             Repeater {
-                model: root.claudeLive.concat(root.codexLive)
+                model: root.sortedAccounts
 
-                delegate: BarMetric {
+                delegate: BarIcon {
                     required property var modelData
 
                     account: modelData
@@ -430,7 +388,7 @@ PluginComponent {
             spacing: Theme.spacingXS
 
             DankIcon {
-                visible: root.claudeLive.length === 0 && root.codexLive.length === 0
+                visible: root.sortedAccounts.length === 0
                 name: "data_usage"
                 size: Theme.iconSize - 6
                 color: root.loadFailed ? Theme.error : Theme.surfaceVariantText
@@ -438,9 +396,9 @@ PluginComponent {
             }
 
             Repeater {
-                model: root.claudeLive.concat(root.codexLive)
+                model: root.sortedAccounts
 
-                delegate: BarMetric {
+                delegate: BarIcon {
                     required property var modelData
 
                     account: modelData
@@ -454,18 +412,37 @@ PluginComponent {
         PopoutComponent {
             id: popout
 
-            Item {
+            // Grow with the account list, then scroll instead of leaving the screen.
+            readonly property real maxListHeight: Math.max(240,
+                (popout.parentPopout && popout.parentPopout.screen ? popout.parentPopout.screen.height : 1080) * 0.7)
+
+            Flickable {
+                id: listFlick
+
                 width: parent.width
-                implicitHeight: contentColumn.implicitHeight + Theme.spacingS * 2
+                implicitHeight: Math.min(contentColumn.implicitHeight + Theme.spacingS * 2, popout.maxListHeight)
+                contentWidth: width
+                contentHeight: contentColumn.implicitHeight + Theme.spacingS * 2
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                interactive: contentHeight > height
+
+                // Clicking anywhere outside a scroll gesture closes the popout.
+                MouseArea {
+                    width: listFlick.contentWidth
+                    height: listFlick.contentHeight
+                    acceptedButtons: Qt.AllButtons
+                    onClicked: root.closePopout()
+                }
 
                 Column {
                     id: contentColumn
 
-                    readonly property var sections: root.claudeLive.concat(root.codexLive, root.offlineAccounts)
+                    readonly property var sections: root.sortedAccounts
 
                     x: Theme.spacingS
                     y: Theme.spacingS
-                    width: parent.width - Theme.spacingS * 2
+                    width: listFlick.width - Theme.spacingS * 2 - (scrollBar.visible ? scrollBar.width : 0)
 
                     Repeater {
                         model: contentColumn.sections
@@ -486,29 +463,34 @@ PluginComponent {
                             AccountSection {
                                 width: parent.width
                                 account: modelData
-                                topPadding: index > 0 ? Theme.spacingM : 0
-                                bottomPadding: index < contentColumn.sections.length - 1 ? Theme.spacingM : 0
+                                topPadding: index > 0 ? Theme.spacingS + 2 : 0
+                                bottomPadding: index < contentColumn.sections.length - 1 ? Theme.spacingS + 2 : 0
                             }
                         }
                     }
 
                     StyledText {
                         visible: root.accounts.length === 0
-                        text: root.loadFailed ? "Collector failed" : "No accounts configured"
+                        text: root.loadFailed ? "Collector failed" : "No subscriptions found"
                         font.pixelSize: Theme.fontSizeMedium
                         color: Theme.surfaceVariantText
                     }
                 }
 
-                MouseArea {
-                    anchors.fill: parent
-                    anchors.margins: -Theme.spacingS
-                    acceptedButtons: Qt.AllButtons
-                    onClicked: root.closePopout()
+                Rectangle {
+                    id: scrollBar
+
+                    visible: listFlick.interactive
+                    x: listFlick.width - width
+                    y: listFlick.contentY + listFlick.visibleArea.yPosition * listFlick.height
+                    width: 3
+                    height: listFlick.visibleArea.heightRatio * listFlick.height
+                    radius: width / 2
+                    color: Theme.withAlpha(Theme.surfaceText, 0.3)
                 }
             }
         }
     }
 
-    popoutWidth: 360
+    popoutWidth: 380
 }

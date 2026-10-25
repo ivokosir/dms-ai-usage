@@ -10,8 +10,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from dms_ai_usage.collector import collect, collect_cached, fetch_proxy_accounts, iso_now, load_config, UsageError
-from dms_ai_usage.proxy import collect_proxy, NoRedirect, select_usage, ProxyError
+from dms_ai_usage.collector import collect, collect_cached, fetch_proxy_accounts, iso_now, load_config, source_fingerprint, UsageError
+from dms_ai_usage.proxy import collect_proxy, discovered_accounts, NoRedirect, select_usage, ProxyError
 
 
 class ProxyTests(unittest.TestCase):
@@ -28,7 +28,7 @@ class ProxyTests(unittest.TestCase):
             ],
         }
         self.files = {"files": [
-            {"name": "claude.json", "provider": "claude", "auth_index": "claude-index"},
+            {"name": "claude.json", "provider": "claude", "auth_index": "claude-index", "email": "account@example.test"},
             {"name": "codex.json", "provider": "codex", "auth_index": "codex-index",
              "id_token": {"chatgpt_account_id": "private-account-id"}},
         ]}
@@ -75,8 +75,6 @@ class ProxyTests(unittest.TestCase):
         config = {
             "cliproxyapi": {"ssh_host": "test-server", "management_key_file": str(self.key_path),
                             "base_url": f"http://127.0.0.1:{server.server_port}"},
-            "claude": [dict(self.options["accounts"][0])],
-            "codex": [dict(self.options["accounts"][1])],
         }
         real_run = subprocess.run
         ssh_output = []
@@ -102,10 +100,12 @@ class ProxyTests(unittest.TestCase):
         for serialized in (json.dumps(payload), *ssh_output):
             self.assertNotIn("private-", serialized)
             self.assertNotIn("auth_index", serialized)
+        self.assertEqual(payload["accounts"][0]["email"], "account@example.test")
         self.assertEqual(len(calls), 3)
         self.assertTrue(all(auth == "Bearer private-management-secret" for _, auth, _ in calls))
-        self.assertEqual(calls[1][2]["header"]["Authorization"], "Bearer $TOKEN$")
-        self.assertEqual(calls[2][2]["header"]["Chatgpt-Account-Id"], "private-account-id")
+        provider_calls = {body["auth_index"]: body for _, _, body in calls if body is not None}
+        self.assertEqual(provider_calls["claude-index"]["header"]["Authorization"], "Bearer $TOKEN$")
+        self.assertEqual(provider_calls["codex-index"]["header"]["Chatgpt-Account-Id"], "private-account-id")
 
     def test_upstream_401_inside_successful_management_response(self) -> None:
         with patch("dms_ai_usage.proxy.request_json", side_effect=[self.files,
@@ -148,7 +148,7 @@ class ProxyTests(unittest.TestCase):
         config = {"cliproxyapi": {"ssh_host": "server", "management_key_file": "~/key"},
                   "claude": [{"label": "Personal", "proxy_auth_file": "claude.json"}]}
         cache_path = Path(self.directory.name) / "usage.json"
-        old = {"schema": 1, "accounts": [{"provider": "claude", "label": "Personal", "status": "ok",
+        old = {"schema": 1, "source_fingerprint": source_fingerprint(config), "accounts": [{"provider": "claude", "label": "Personal", "status": "ok",
             "updated_at": "2026-09-29T00:00:00Z", "windows": [
                 {"id": "seven_day", "label": "7d", "remaining_percent": 30},
                 {"id": "model:fable", "label": "Fable", "remaining_percent": 99}]}]}
@@ -178,6 +178,83 @@ class ProxyTests(unittest.TestCase):
         with patch("dms_ai_usage.collector.subprocess.run", side_effect=subprocess.TimeoutExpired("ssh", 8)):
             result = fetch_proxy_accounts(config, 8)
         self.assertEqual(result[("claude", "Personal")]["error"], "timeout")
+
+    def test_discovery_includes_unlisted_and_disabled_accounts_without_private_metadata(self) -> None:
+        extra = {"name": "private-email@example.test.json", "provider": "claude",
+                 "auth_index": "private-index", "disabled": True}
+        files = {"files": self.files["files"] + [extra,
+            {"name": "other.json", "provider": "unsupported", "auth_index": "other"}]}
+        def request(_base, _key, path, _timeout, body=None):
+            if path == "auth-files":
+                return files
+            self.assertNotEqual(body["auth_index"], "private-index")
+            data = ({"seven_day": {"utilization": 10}} if body["auth_index"] == "claude-index"
+                    else {"rate_limit": {"primary_window": {"used_percent": 20, "limit_window_seconds": 604800}}})
+            return {"status_code": 200, "body": json.dumps(data)}
+        with patch("dms_ai_usage.proxy.request_json", side_effect=request):
+            payload = collect_proxy(dict(self.options, discover_accounts=True, accounts=[]))
+        self.assertEqual(len(payload["accounts"]), 3)
+        self.assertEqual(sum(a.get("error") == "not_connected" for a in payload["accounts"]), 1)
+        self.assertTrue(all(len(a["account_id"]) == 24 for a in payload["accounts"]))
+        self.assertNotIn("private-", json.dumps(payload))
+        self.assertNotIn(".json", json.dumps(payload))
+
+    def test_discovery_aliases_do_not_filter_accounts_and_ids_survive_reordering(self) -> None:
+        before = discovered_accounts(self.files["files"], self.options["accounts"][:1])
+        self.assertEqual([a["label"] for a in before], ["Personal", "Account 1"])
+        after = discovered_accounts(list(reversed(self.files["files"])), [])
+        self.assertEqual({a["account_id"] for a in before}, {a["account_id"] for a in after})
+
+    def test_discovered_cache_survives_outage_and_does_not_mix_reused_labels(self) -> None:
+        config = {"cliproxyapi": {"ssh_host": "server", "management_key_file": "~/key"}}
+        path = Path(self.directory.name) / "usage.json"
+        old = {"schema": 1, "source_fingerprint": source_fingerprint(config), "accounts": [{"provider": "claude", "label": "Account 1", "account_id": "a" * 24,
+            "status": "ok", "windows": [{"id": "seven_day", "label": "7d", "remaining_percent": 30}]}]}
+        path.write_text(json.dumps(old))
+        with patch("dms_ai_usage.collector.subprocess.run", return_value=subprocess.CompletedProcess([], 255, "")):
+            stale = collect(config, path)["accounts"][0]
+        self.assertEqual((stale["status"], stale["account_id"]), ("stale", "a" * 24))
+        remote = {"accounts": [{"provider": "claude", "label": "Account 1", "account_id": "b" * 24,
+                                "error": "auth_expired"}]}
+        with patch("dms_ai_usage.collector.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps(remote))):
+            fresh = collect(config, path)["accounts"][0]
+        self.assertEqual(fresh["status"], "error")
+        self.assertEqual(fresh["windows"], [])
+
+    def test_switching_proxy_invalidates_fresh_cache_and_stale_readings(self) -> None:
+        old_config = {"cliproxyapi": {"ssh_host": "old-server", "management_key_file": "~/key"}}
+        new_config = {"cliproxyapi": {"ssh_host": "new-server", "management_key_file": "~/key"}}
+        path = Path(self.directory.name) / "usage.json"
+        old = {"schema": 1, "generated_at": iso_now(), "source_fingerprint": source_fingerprint(old_config),
+               "accounts": [{"provider": "claude", "label": "Account 1", "account_id": "a" * 24,
+               "status": "ok", "windows": [{"id": "seven_day", "label": "7d", "remaining_percent": 30}]}]}
+        path.write_text(json.dumps(old))
+        remote = {"accounts": [{"provider": "claude", "label": "Account 1", "account_id": "a" * 24,
+                                "error": "auth_expired"}]}
+        with patch("dms_ai_usage.collector.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps(remote))) as request:
+            result = collect_cached(new_config, path)
+        request.assert_called_once()
+        self.assertEqual(result["accounts"][0]["status"], "error")
+        self.assertEqual(result["accounts"][0]["windows"], [])
+        self.assertEqual(result["source_fingerprint"], source_fingerprint(new_config))
+        self.assertNotIn("new-server", path.read_text())
+
+    def test_widget_config_requires_proxy_accounts_and_accepts_examples(self) -> None:
+        path = Path(self.directory.name) / "config.json"
+        connection = {"ssh_host": "my-server", "management_key_file": "~/management.key"}
+        for config in (
+            {"claude": [{"label": "Local", "config_dir": "~/profile"}]},
+            {"cliproxyapi": connection, "codex": [{"label": "Local", "home": "~/profile"}]},
+            {"cliproxyapi": connection, "claude": [{"label": "Mixed", "proxy_auth_file": "a.json", "config_dir": "~/profile"}]},
+        ):
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(UsageError, "invalid_config"):
+                load_config(path)
+        root = Path(__file__).resolve().parents[1]
+        for name in ("config.example.json", "config.proxy.example.json"):
+            config = load_config(root / name)
+            self.assertEqual(config["cliproxyapi"]["ssh_host"], "my-server")
+            self.assertTrue(all("proxy_auth_file" in a for provider in ("claude", "codex") for a in config.get(provider, [])))
 
     def test_proxy_account_requires_valid_connection_config(self) -> None:
         path = Path(self.directory.name) / "config.json"

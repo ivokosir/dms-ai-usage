@@ -5,11 +5,5 @@
     "ssh_host": "my-server",
     "base_url": "http://127.0.0.1:8317",
     "management_key_file": "~/.config/cliproxyapi/management.key"
-  },
-  "claude": [
-    {"label": "Personal", "proxy_auth_file": "claude-personal.json"}
-  ],
-  "codex": [
-    {"label": "Personal", "proxy_auth_file": "codex-personal.json"}
-  ]
+  }
 }

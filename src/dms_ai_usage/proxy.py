@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import urllib.error
@@ -75,7 +77,7 @@ def quota_window(raw: Any, used_key: str, reset_key: str) -> dict[str, Any] | No
 
 
 def select_usage(provider: str, data: dict[str, Any]) -> dict[str, Any]:
-    """Only quota numbers and reset times may cross back over SSH."""
+    """Select quota fields; account emails come only from auth-list metadata."""
     selected: dict[str, Any] = {}
     if provider == "claude":
         for name in ("five_hour", "seven_day"):
@@ -101,6 +103,33 @@ def select_usage(provider: str, data: dict[str, Any]) -> dict[str, Any]:
     return selected
 
 
+def discovered_accounts(files: list[Any], aliases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Discover supported subscriptions without returning auth filenames."""
+    labels = {(a["provider"], a["proxy_auth_file"]): a["label"] for a in aliases}
+    supported = [f for f in files if isinstance(f, dict)
+                 and f.get("provider") in ("claude", "codex")
+                 and isinstance(f.get("name"), str) and f["name"]]
+    if len(supported) > 200:
+        raise ProxyError("too_many_accounts")
+    identities = [(f["provider"], f["name"]) for f in supported]
+    if len(set(identities)) != len(identities):
+        raise ProxyError("bad_response")
+    used = {provider: {label for (p, _), label in labels.items() if p == provider}
+            for provider in ("claude", "codex")}
+    result = []
+    for provider, name in sorted(identities):
+        label = labels.get((provider, name))
+        if label is None:
+            number = 1
+            while f"Account {number}" in used[provider]:
+                number += 1
+            label = f"Account {number}"
+            used[provider].add(label)
+        result.append({"provider": provider, "proxy_auth_file": name, "label": label,
+                       "account_id": hashlib.sha256((provider + "/" + name).encode()).hexdigest()[:24]})
+    return result
+
+
 def collect_proxy(options: dict[str, Any]) -> dict[str, Any]:
     try:
         base_url = options.get("base_url", "http://127.0.0.1:8317")
@@ -123,17 +152,28 @@ def collect_proxy(options: dict[str, Any]) -> dict[str, Any]:
         files = request_json(base_url, key, "auth-files", timeout).get("files")
         if not isinstance(files, list):
             raise ProxyError("bad_response")
-        accounts = []
-        for account in options["accounts"]:
+        configured = options.get("accounts", [])
+        discover = options.get("discover_accounts", False)
+        selected = discovered_accounts(files, configured) if discover else configured
+
+        def collect_account(account: dict[str, Any]) -> dict[str, Any]:
             provider = account["provider"]
             result = {"provider": provider, "label": account["label"]}
+            if "account_id" in account:
+                result["account_id"] = account["account_id"]
             try:
                 matches = [item for item in files if isinstance(item, dict)
                            and item.get("name") == account["proxy_auth_file"]
                            and item.get("provider") == provider]
-                if len(matches) != 1 or matches[0].get("disabled"):
+                if len(matches) != 1:
                     raise ProxyError("not_connected")
                 auth = matches[0]
+                email = auth.get("email")
+                if (isinstance(email, str) and "@" in email and len(email) <= 254
+                        and not any(c.isspace() or ord(c) < 32 for c in email)):
+                    result["email"] = email
+                if auth.get("disabled"):
+                    raise ProxyError("not_connected")
                 index = auth.get("auth_index")
                 if not isinstance(index, str) or not index:
                     raise ProxyError("not_connected")
@@ -164,7 +204,13 @@ def collect_proxy(options: dict[str, Any]) -> dict[str, Any]:
                 result["usage"] = select_usage(provider, data)
             except ProxyError as exc:
                 result["error"] = str(exc)
-            accounts.append(result)
+            return result
+
+        if discover:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                accounts = list(executor.map(collect_account, selected))
+        else:
+            accounts = [collect_account(account) for account in selected]
         return {"accounts": accounts}
     except ProxyError as exc:
         return {"error": str(exc)}

@@ -9,3 +9,15 @@ config.json
 usage.json
 .ui-captures/
 *.ui.png
+
+# Private local settings and authentication material
+config.*.json
+!config.example.json
+!config.proxy.example.json
+.env
+.env.*
+*.key
+*.pem
+auth.json
+.credentials.json
+ACCESS.txt
